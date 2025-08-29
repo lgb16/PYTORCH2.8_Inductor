@@ -4564,9 +4564,14 @@ class TemplateBuffer(OperationBuffer):
                 assert len(rindex) == 0
                 ops.load(inp.get_name(), indexer(index))
 
-            deps.reads |= dependencies.extract_read_writes(
-                dummy, inp.get_size(), (), normalize=True
-            ).reads
+            if config.common_indexing_fusion and config.loop_ordering_after_fusion:
+                deps.reads |= dependencies.extract_read_writes(
+                    dummy, inp.get_size(), (), normalize=normalize
+                ).reads
+            else:
+                deps.reads |= dependencies.extract_read_writes(
+                    dummy, inp.get_size(), (), normalize=True
+                ).reads
 
         return deps
 

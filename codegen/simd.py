@@ -1251,8 +1251,68 @@ class SIMDScheduling(BaseScheduling):
         # swap args to hit the case above
         return self.can_fuse_horizontal(node2, node1)
 
-    can_fuse_vertical = can_fuse
-    can_fuse_horizontal = can_fuse
+    #################################### WELDER ######################################
+    def can_fuse_with_index(self, node1, node2):
+        """
+        Hook called by Scheduler to determine if the Triton backend
+        can fuse node1 and node2.  These nodes might already be
+        FusedSchedulerNodes.
+        """
+        if isinstance(node1, scheduler.ForeachKernelSchedulerNode) or isinstance(
+            node2, scheduler.ForeachKernelSchedulerNode
+        ):
+            return scheduler.ForeachKernelSchedulerNode.can_fuse(node1, node2)
+
+        _, (numel1, rnumel1) = node1.group
+        _, (numel2, rnumel2) = node2.group
+        why = WhyNoFuse(node1, node2)
+
+        if node1.is_split_scan() and not node2.is_split_scan():
+            if node2.is_reduction():
+                why("Split scan cannot fuse with reductions")
+        elif node2.is_split_scan() and not node1.is_split_scan():
+            if node1.is_reduction():
+                why("Split scan cannot fuse with reductions")
+
+        node1_buffer_names = node1.read_writes.buffer_names()
+        node2_buffer_names = node2.read_writes.buffer_names()
+        # Fast path: no common buffers.
+        common_buffer_names = node1_buffer_names & node2_buffer_names
+        if not common_buffer_names:
+            return 0
+        
+        node1_is_first = False
+        node2_is_first = False
+        for name in common_buffer_names:
+            if name in node1.read_writes.write_buffer_names():
+                node1_is_first = True
+            if name in node2.read_writes.write_buffer_names():
+                node2_is_first = True
+        
+        if node1_is_first and node2_is_first:
+            return False
+        if node2_is_first:
+            first_node = node2
+            second_node = node1
+        else:
+            first_node = node1
+            second_node = node2
+
+        default_tile = second_node.propagate_default_tile()
+        propagated_tile = first_node.propagate_output_tile(default_tile)
+        if propagated_tile is None:
+            return False
+        return True
+
+    if config.common_indexing_fusion:
+        can_fuse_vertical = can_fuse_with_index
+        can_fuse_horizontal = can_fuse_with_index
+    else:
+        can_fuse_vertical = can_fuse
+        can_fuse_horizontal = can_fuse
+    ##########################################################################
+    # can_fuse_vertical = can_fuse
+    # can_fuse_horizontal = can_fuse
 
     def generate_node_schedule(self, nodes, numel, rnumel):
         node_schedule: list[Any] = []

@@ -666,6 +666,19 @@ joint_graph_constant_folding = True
 # Enable indirect_indexing asserts for decompositions and lowerings
 debug_index_asserts = False
 
+########################################## WELDER ######################################
+# For improved Fusion
+# loop_ordering_after_fusion also useful
+common_indexing_fusion = False
+force_matching_index = False
+
+# For Debugging
+print_var_ranges = False
+always_skip_benchmark = False
+
+##########################################################################################
+
+
 # Mode to emulate PyTorch eager numerics when doing lower precision compute
 # (fp16, bf16).  PyTorch eager computes bf16/fp16 by upcasting inputs to fp32
 # and downcasting after.  When two low precision operators are fused together,

@@ -887,6 +887,15 @@ class BaseSchedulerNode:
         return prologue, template_node, epilogue
 
 
+    ############################################## WELDER #################################################
+    def propagate_default_tile(self):
+        return None
+
+    def propagate_output_tile(self, tile_var_ranges: dict[str, dict[sympy.Symbol, sympy.Expr]]):
+        return None
+    #####################################################################################################
+
+
 class WhyNoFuse:
     # TODO when we drop support for Python < 3.10, we can use
     # @dataclass(slots=True) instead of manually specifying __slots__.
@@ -1110,13 +1119,23 @@ class SchedulerNode(BaseSchedulerNode):
         self_sizes = self._sizes[0]
         if len(self_sizes) == self_dep.num_vars == other_dep.num_vars:
             new_order = self_dep.decide_loop_order_to_match(other_dep)
+            ###################################### WELDER #######################
+            if not new_order and config.common_indexing_fusion:
+                new_order = self_dep.decide_loop_order_with_index(other_dep)
+            #####################################################################
 
         if new_order:
             metrics.num_loop_reordering += 1
             loop_ordering_log.debug(
                 "Reorder loops for %s with order %s", self.get_name(), new_order
             )
-            self.apply_new_loop_order(new_order)
+            if not (config.common_indexing_fusion and config.loop_ordering_after_fusion):
+                self.apply_new_loop_order(new_order)
+            elif self._body is not None:
+                # WELDER : handling error case when apply loop_ordering_after_fusion with triton Template
+                # triton Template buffer doesn't have loop_body, they make error message with default code
+                # when you apply both common_indexing_fusion and loop_ordering_after_fusion, inductor would apply new_loop_order when Node have loop_body
+                self.apply_new_loop_order(new_order)
         else:
             loop_ordering_log.debug(
                 "Don't reordering %s because we can not decide the suitable loop order",
@@ -1256,6 +1275,68 @@ class SchedulerNode(BaseSchedulerNode):
                     )
         return buffers_store_as_atomic_add
 
+    ################################# WELDER #####################################
+    def propagate_default_tile(self):
+        var_in_reads = set([
+            name
+            for dep in self.read_writes.reads
+            if isinstance(dep, MemoryDep)
+            for name in dep.index.free_symbols
+        ])
+        var_in_writes = set([
+            name
+            for dep in self.read_writes.writes
+            if isinstance(dep, MemoryDep)
+            for name in dep.index.free_symbols
+        ])
+
+        common_vars = var_in_reads & var_in_writes
+
+        updated_range_vars = {
+            key: 1 if key in common_vars else value
+            for key, value in self.read_writes.var_ranges.items()
+        }
+
+        name_to_tile: Dict[str, Dict[sympy.Symbol, sympy.Expr]] = {}
+        for dep in self.read_writes.reads_and_writes():
+            if not isinstance(dep, MemoryDep):
+                continue
+            name_to_tile[dep.name] = {}
+            for name in dep.index.free_symbols:
+                range_vars = updated_range_vars.get(name)
+                if range_vars is None:
+                    continue
+                name_to_tile[dep.name][name] = range_vars
+        ## TODO
+        ## dep가 StarDep, WeakDep인 경우의 handling
+        ## inderect로 생성되는 tmp handling
+
+        return name_to_tile
+
+    def propagate_output_tile(self, tile_var_ranges: dict[str, dict[sympy.Symbol, sympy.Expr]]):
+        default_tile_ranges = self.propagate_default_tile()
+
+        for buf_name, tile_range in default_tile_ranges.items():
+            p_tile_range = tile_var_ranges.get(buf_name)
+            if p_tile_range is None:
+                continue
+            for var, size in tile_range.items():
+                if size == 1 and p_tile_range[var] != 1:
+                    tile_range[var] = p_tile_range[var]
+                elif size != 1 and p_tile_range[var] == 1:
+                    ## TODO
+                    ## reduction에 대한 propagate handling
+                    continue
+                elif size == p_tile_range[var]:
+                    continue
+                else:
+                    ## default tile size는 항상 1을 가져간다고 가정
+                    ## p_tile_range는 propagate해서 온 결과이기 때문에 임의의 size를 가질 수 있지만,
+                    ## tile_range는 default_tile을 계산했기 떄문에 1 또는 tensor_size의 값만을 가짐(가정)
+                    return None
+        return default_tile_ranges
+    ########################################################################################
+
 
 def refresh_group_node_dependencies(
     group_snode: Union[FusedSchedulerNode, GroupedSchedulerNode],
@@ -1296,6 +1377,32 @@ def init_group_node(
         buf.get_name(): buf for buf in group_snode.get_outputs()
     }
 
+
+############################ WELDER #############################
+def merge_tile_ranges(
+    name_to_tile_range_1: Dict[str, Dict[sympy.Symbol, sympy.Expr]],
+    name_to_tile_range_2: Dict[str, Dict[sympy.Symbol, sympy.Expr]],
+) -> Dict[str, Dict[sympy.Symbol, sympy.Expr]]:
+    merged_range = {}
+    merged_range.update(name_to_tile_range_1)
+    
+    for name, tile_range in name_to_tile_range_2.items():
+        if name in merged_range:
+            if merged_range[name] == tile_range:
+                pass
+            else:
+                for var, size in tile_range.items():
+                    if size != 1 and merged_range[name][var] == 1:
+                        merged_range[name][var] = size
+                    elif (size == 1 and merged_range[name][var]) or (size == merged_range[name][var]):
+                        continue
+                    else:
+                        return None
+        else:
+            merged_range[name] = tile_range
+            
+    return merged_range
+##############################################################
 
 class FusedSchedulerNode(BaseSchedulerNode):
     """
@@ -1524,6 +1631,43 @@ class FusedSchedulerNode(BaseSchedulerNode):
             log.warning("Ignoring error in debug_str()", exc_info=True)
 
         return buf.getrawvalue().rstrip()
+
+    ####################################### WELDER ##########################################
+    def propagate_default_tile(self):
+        topo_nodes = self.scheduler.topological_sort_schedule(self.snodes)
+        topo_nodes.reverse()
+
+        fused_tile_ranges = topo_nodes[0].propagate_default_tile()
+        if fused_tile_ranges is None:
+            return None
+        for node in topo_nodes[1:]:
+            propagate_tile_ranges = node.propagate_output_tile(fused_tile_ranges)
+            if propagate_tile_ranges is None:
+                return None
+            fused_tile_ranges = merge_tile_ranges(fused_tile_ranges, propagate_tile_ranges)
+            if fused_tile_ranges is None:
+                return None           
+
+        return fused_tile_ranges
+    
+
+    def propagate_output_tile(self, tile_var_ranges: Dict[str, Dict[sympy.Symbol, sympy.Expr]]):
+        topo_nodes = self.scheduler.topological_sort_schedule(self.snodes)
+        topo_nodes.reverse()
+
+        fused_tile_ranges = topo_nodes[0].propagate_output_tile(tile_var_ranges)
+        if fused_tile_ranges is None:
+            return None
+        for node in topo_nodes[1:]:
+            propagate_tile_ranges = node.propagate_output_tile(fused_tile_ranges)
+            if propagate_tile_ranges is None:
+                return None
+            fused_tile_ranges = merge_tile_ranges(fused_tile_ranges, propagate_tile_ranges)
+            if fused_tile_ranges is None:
+                return None           
+
+        return fused_tile_ranges
+    #################################################################################
 
 
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
@@ -2093,6 +2237,9 @@ class Scheduler:
         metrics.ir_nodes_pre_fusion += len(self.nodes)
         from torch._inductor.debug import log_ir_post_fusion, log_ir_pre_fusion
 
+        if config.print_var_ranges:
+            self.print_nodes_var_ranges("pre_fusion")
+
         log_ir_pre_fusion(self.nodes)
         self.num_orig_nodes = len(self.nodes)
         self.create_foreach_nodes()
@@ -2132,6 +2279,9 @@ class Scheduler:
         log_ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
+
+        if config.print_var_ranges:
+            self.print_nodes_var_ranges("post_fusion")
 
         # used during codegen:
         self.buffer_names_to_free: OrderedSet[str] = OrderedSet()
@@ -2811,6 +2961,8 @@ class Scheduler:
         If config.benchmark_fusion is False, always return True.
         Otherwise, return True if fusion can brings speedup.
         """
+        if config.always_skip_benchmark:
+            return True
 
         is_multi_template = any(
             n.is_template()
@@ -3539,6 +3691,93 @@ class Scheduler:
 
         return self.score_fusion_memory(node1, node2)
 
+    ##################################### WELDER #############################################
+    def compare_dep_with_free_symbol(
+        self, dep1: Dep, dep2: Dep
+    ) -> bool:
+        if dep1.is_indirect() or dep2.is_indirect():
+            return False
+        normalize_dep1 = dep1 # .normalize_with_stride_order()
+        normalize_dep2 = dep2 # .normalize_with_stride_order()
+        if (
+            normalize_dep1.name == normalize_dep2.name
+            and normalize_dep1.index == normalize_dep2.index
+            and normalize_dep1.get_free_sym_ranges() == normalize_dep2.get_free_sym_ranges()
+            and normalize_dep1.mode == normalize_dep2.mode
+        ):
+            return True
+        return False
+           
+
+    def shared_data_with_common_index(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        if any(
+            n.is_cpu() for n in [node1, node2]
+        ):
+            return 0
+
+        node1_buffer_names = node1.read_writes.buffer_names()
+        node2_buffer_names = node2.read_writes.buffer_names()
+        # Fast path: no common buffers.
+        common_buffer_names = node1_buffer_names & node2_buffer_names
+        if not common_buffer_names:
+            return 0
+
+        node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
+        node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
+
+        # Find the commons buffers that has different loop orders
+        candidates = []
+        for buffer_name in common_buffer_names:
+            lhs_dep = node1_name2dep[buffer_name]
+            rhs_dep = node2_name2dep[buffer_name]
+            if self.compare_dep_with_free_symbol(lhs_dep, rhs_dep):
+                # print(f"Candidate : {lhs_dep} & {rhs_dep}")
+                candidates.append(
+                    (
+                        V.graph.sizevars.size_hint(lhs_dep.get_numel(), fallback=0),
+                        lhs_dep,
+                        rhs_dep,
+                    )
+                )
+
+        if len(candidates) == 0:
+            return 0
+
+        # Pick the largest buffer to guide the loop reordering
+        numel, lhs_dep, rhs_dep = max(candidates, key=lambda x: x[0])
+
+        if lhs_dep.num_vars != rhs_dep.num_vars:
+            # this can happen due to we don't merge loops.
+            # We can not do loop reordering in this case right now
+            # Simply returning true if the two Deps are the same after
+            # normalization (merging loops)
+            if lhs_dep.normalize() == rhs_dep.normalize():
+                return self.dep_size_hint(lhs_dep)
+            return 0
+
+        # Only reorder loops for pointwise for now
+        if not node1.is_reduction():
+            node1.reorder_loops_by_dep_pair(lhs_dep, rhs_dep)
+        elif not node2.is_reduction():
+            node2.reorder_loops_by_dep_pair(rhs_dep, lhs_dep)
+        else:
+            loop_ordering_log.debug(
+                "Don't reorder loops since both nodes are reductions: %s v.s. %s",
+                node1.get_name(),
+                node2.get_name(),
+            )
+
+        return self.score_fusion_memory_with_index(node1, node2)
+
+    def shared_data_with_match_index(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        
+        return self.score_fusion_memory_with_index(node1, node2)
+    #######################################################################################
+
     def unfusable_node(self, node: BaseSchedulerNode) -> bool:
         """
         Is this node unfusable under any conditions.
@@ -3731,6 +3970,12 @@ class Scheduler:
             and config.loop_ordering_after_fusion
         ):
             shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
+        ############################ WELDER #########################################
+        if shared_data_score < config.score_fusion_memory_threshold and config.common_indexing_fusion:
+            shared_data_score = self.shared_data_with_common_index(node1, node2)
+        if shared_data_score < config.score_fusion_memory_threshold and config.force_matching_index:
+            shared_data_score = self.shared_data_with_match_index(node1, node2)
+        #############################################################################
 
         if loop_ordering_log.isEnabledFor(logging.DEBUG):
             loop_ordering_log.debug(
@@ -3924,6 +4169,18 @@ class Scheduler:
             node2.read_writes.reads | node2.read_writes.writes
         )
         return sum(self.dep_size_hint(dep) for dep in common_memory_deps)
+
+    ################################ WELDER ######################################
+    def score_fusion_memory_with_index(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        score = 0
+        for dep1 in itertools.chain(node1.read_writes.reads, node1.read_writes.writes):
+            for dep2 in itertools.chain(node2.read_writes.reads, node2.read_writes.writes):
+                if self.compare_dep_with_free_symbol(dep1, dep2):
+                    score += self.dep_size_hint(dep1)
+        return score
+    ################################################################################
 
     def get_possible_fusions_with_highest_priority(
         self, possible_fusions: list[tuple[BaseSchedulerNode, BaseSchedulerNode]]
@@ -4883,6 +5140,52 @@ class Scheduler:
                     ):
                         V.graph.zero_dim_cpu_tensor_list.add(read.name)
 
+    ############################# WELDER #######################################
+    def print_nodes_var_ranges(self, text) -> None:
+        # TODO
+        # print to txt file with name text
+        # e.g. pre_fusion_node.txt
+        buffer_names_grouping = defaultdict(lambda: {"reads": [], "writes": []})
+        for node in self.nodes:
+            if self.unfusable_node(node):
+                continue
+            for buf in node.read_writes.reads:
+                if not isinstance(buf, MemoryDep):
+                    buffer_names_grouping[buf.name]["reads"].append((node.get_name(), "not MemoryDep"))
+                else:
+                    buffer_names_grouping[buf.name]["reads"].append((node.get_name(), buf.index, buf.ranges))
+            for buf in node.read_writes.writes:
+                if not isinstance(buf, MemoryDep):
+                    buffer_names_grouping[buf.name]["writes"].append((node.get_name(), "not MemoryDep"))
+                else:
+                    buffer_names_grouping[buf.name]["writes"].append((node.get_name(), buf.index, buf.ranges))
+        filename = f"{text}.txt"
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(f"\n{text}\n\n")
+                for buf, access in buffer_names_grouping.items():
+                    f.write(f'\n{buf}\n')
+                    if access["reads"]:
+                        f.write("reads:\n")
+                        for r in access["reads"]:
+                            f.write(f"  {r}\n")
+                    if access["writes"]:
+                        f.write("writes:\n")
+                        for w in access["writes"]:
+                            f.write(f"  {w}\n")
+        except IOError as e:
+            print(f"Error writing to file {filename}: {e}")
+        # for buf, access in buffer_names_grouping.items():
+        #     print('\n', buf)
+        #     if access["reads"]:
+        #         print("reads:")
+        #         for r in access["reads"]:
+        #             print(f"  {r}")
+        #     if access["writes"]:
+        #         print("writes:")
+        #         for w in access["writes"]:
+        #             print(f"  {w}")
+    ################################################################################
 
 class BaseScheduling:
     def __init__(self, scheduler: Optional[Scheduler]):
