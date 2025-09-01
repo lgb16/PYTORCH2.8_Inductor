@@ -671,6 +671,7 @@ debug_index_asserts = False
 # loop_ordering_after_fusion also useful
 common_indexing_fusion = False
 force_matching_index = False
+skip_compare_normalized_dep = False
 
 # For Debugging
 print_var_ranges = False
@@ -1680,6 +1681,10 @@ class trace:
 
     # Save TorchInductor IR after fusion pass
     ir_post_fusion = True
+
+    ################# WELDER ###############
+    print_nodes_var_ranges = True
+    ########################################
 
     # Copy generated code to trace dir
     output_code = True

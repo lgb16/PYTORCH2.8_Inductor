@@ -25,7 +25,7 @@ import sympy
 
 import torch
 import torch._inductor.async_compile  # noqa: F401 required to warm up AsyncCompile pools
-from torch._dynamo.utils import counters, dynamo_timed
+from torch._dynamo.utils import counters, dynamo_timed, get_debug_dir
 from torch._inductor.codecache import LambdaFuture, PyCodeCache
 from torch._inductor.metrics import get_metric_table, is_metric_table_enabled
 from torch.fx.experimental.symbolic_shapes import free_symbols
@@ -2235,10 +2235,10 @@ class Scheduler:
         self.compute_ancestors()
 
         metrics.ir_nodes_pre_fusion += len(self.nodes)
-        from torch._inductor.debug import log_ir_post_fusion, log_ir_pre_fusion
+        from torch._inductor.debug import log_ir_post_fusion, log_ir_pre_fusion, log_nodes_var_ranges
 
         if config.print_var_ranges:
-            self.print_nodes_var_ranges("pre_fusion")
+            log_nodes_var_ranges("var_ranges_pre_fusion", self.nodes)
 
         log_ir_pre_fusion(self.nodes)
         self.num_orig_nodes = len(self.nodes)
@@ -2281,7 +2281,7 @@ class Scheduler:
         self.debug_draw_graph()
 
         if config.print_var_ranges:
-            self.print_nodes_var_ranges("post_fusion")
+            log_nodes_var_ranges("var_ranges_post_fusion", self.nodes)
 
         # used during codegen:
         self.buffer_names_to_free: OrderedSet[str] = OrderedSet()
@@ -3668,7 +3668,7 @@ class Scheduler:
         if not isinstance(lhs_dep, MemoryDep) or not isinstance(rhs_dep, MemoryDep):
             return 0
 
-        if lhs_dep.num_vars != rhs_dep.num_vars:
+        if lhs_dep.num_vars != rhs_dep.num_vars and not config.skip_compare_normalized_dep:
             # this can happen due to we don't merge loops.
             # We can not do loop reordering in this case right now
             # Simply returning true if the two Deps are the same after
@@ -3774,6 +3774,141 @@ class Scheduler:
     def shared_data_with_match_index(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> int:
+        def compare_and_map_nodes(node1_dep, node2_dep):
+            # 1. Calculate strides for each variable
+
+            # 2. Combine variable info and sort by stride
+            node1_ranges = node1_dep.get_free_sym_ranges()
+            node1_vars = node1_ranges.keys()
+            # node1_strides = V.graph.sizevars.stride_hints(node1_dep.index, node1_ranges)
+            node1_strides = dict(zip(node1_vars, V.graph.sizevars.stride_hints(node1_dep.index, node1_vars)))
+
+            node2_ranges = node1_dep.get_free_sym_ranges()
+            node2_vars = node1_ranges.keys()
+            # node2_strides = V.graph.sizevars.stride_hints(node2_dep.index, node2_ranges)
+            node2_strides = dict(zip(node2_vars, V.graph.sizevars.stride_hints(node2_dep.index, node2_vars)))
+
+            node1_info = sorted(
+                [(var, node1_strides[var], node1_ranges[var]) for var in node1_vars],
+                key=lambda x: x[1]
+            )
+            node2_info = sorted(
+                [(var, node2_strides[var], node2_ranges[var]) for var in node2_vars],
+                key=lambda x: x[1]
+            )
+
+            # 3. Iterate and compare the sorted variables
+            mapped_vars = {}
+            i, j = 0, 0
+            while i < len(node1_info) and j < len(node2_info):
+                var1, stride1, range1 = node1_info[i]
+                var2, stride2, range2 = node2_info[j]
+
+                # Rule 1: Stride Mismatch -> Incompatible
+                if stride1 != stride2:
+                    print(f"Error: Stride mismatch. Cannot handle.")
+                    print(f"  - {node1.get_name()}: {var1} (stride={stride1})")
+                    print(f"  - {node2.get_name()}: {var2} (stride={stride2})")
+                    return None
+
+                # Rule 2: Stride and Range Match -> Direct mapping
+                if range1 == range2:
+                    mapped_vars[var1] = var2
+                    i += 1
+                    j += 1
+                    continue
+
+                # Rule 3: Stride Match, Range Mismatch -> Attempt to merge
+                elif range1 > range2:
+                    # Node 2 has the smaller range, so we try to merge its variables
+                    target_range = range1
+                    merged_range = range2
+                    vars_to_merge = [var2]
+                    k = j + 1
+                    
+                    while merged_range < target_range and k < len(node2_info):
+                        # Check if the next variable is contiguous in memory
+                        next_var, next_stride, next_range = node2_info[k]
+                        prev_var, prev_stride, prev_range = node2_info[k-1]
+                        if next_stride != prev_stride * prev_range:
+                            print("Error: Cannot merge non-contiguous variables in Node 2.")
+                            return None
+                        
+                        merged_range *= next_range
+                        vars_to_merge.append(next_var*prev_range)
+                        k += 1
+
+                    if merged_range == target_range:
+                        mapped_vars[var1] = sum(vars_to_merge)
+                        i += 1
+                        j = k # Move j past all the merged variables
+                    else:
+                        print(f"Error: Range mismatch after merge attempt for {var1} and {var2}.")
+                        return None
+
+                else: # range2 > range1
+                    # Node 1 has the smaller range, so we try to merge its variables
+                    target_range = range2
+                    merged_range = range1
+                    vars_to_merge = [var1]
+                    k = i + 1
+                    
+                    while merged_range < target_range and k < len(node1_info):
+                        # Check if the next variable is contiguous in memory
+                        next_var, next_stride, next_range = node1_info[k]
+                        prev_var, prev_stride, prev_range = node1_info[k-1]
+                        if next_stride != prev_stride * prev_range:
+                            print("Error: Cannot merge non-contiguous variables in Node 1.")
+                            return None
+                        
+                        merged_range *= next_range
+                        vars_to_merge.append(next_var*prev_range)
+                        k += 1
+
+                    if merged_range == target_range:
+                        mapped_vars[sum(vars_to_merge)] = var2
+                        j += 1
+                        i = k # Move i past all the merged variables
+                    else:
+                        print(f"Error: Range mismatch after merge attempt for {var1} and {var2}.")
+                        return None
+
+            # Check if all variables were consumed
+            if i < len(node1_info) or j < len(node2_info):
+                print("Error: Nodes have a different number of effective dimensions.")
+                return None
+
+            return mapped_vars
+        
+        if any(
+            n.is_cpu() for n in [node1, node2]
+        ):
+            return 0
+
+        node1_buffer_names = node1.read_writes.buffer_names()
+        node2_buffer_names = node2.read_writes.buffer_names()
+        # Fast path: no common buffers.
+        common_buffer_names = node1_buffer_names & node2_buffer_names
+        if not common_buffer_names:
+            return 0
+
+        node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
+        node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
+
+        # Find the commons buffers that has different loop orders
+        candidates = []
+        for buffer_name in common_buffer_names:
+            lhs_dep = node1_name2dep[buffer_name]
+            rhs_dep = node2_name2dep[buffer_name]
+            
+            mapped_vars = compare_and_map_nodes(lhs_dep, rhs_dep)
+            if mapped_vars is not None:
+                print(mapped_vars)
+
+            ################################ TODO ###############################
+            ### Dep 에서 필요한 정보 위 함수에 넣기
+            ### 생성된 map 적용하기
+            ### 모든 dep에 전파 및 loop_body에 적용
         
         return self.score_fusion_memory_with_index(node1, node2)
     #######################################################################################
@@ -5140,52 +5275,52 @@ class Scheduler:
                     ):
                         V.graph.zero_dim_cpu_tensor_list.add(read.name)
 
-    ############################# WELDER #######################################
-    def print_nodes_var_ranges(self, text) -> None:
-        # TODO
-        # print to txt file with name text
-        # e.g. pre_fusion_node.txt
-        buffer_names_grouping = defaultdict(lambda: {"reads": [], "writes": []})
-        for node in self.nodes:
-            if self.unfusable_node(node):
-                continue
-            for buf in node.read_writes.reads:
-                if not isinstance(buf, MemoryDep):
-                    buffer_names_grouping[buf.name]["reads"].append((node.get_name(), "not MemoryDep"))
-                else:
-                    buffer_names_grouping[buf.name]["reads"].append((node.get_name(), buf.index, buf.ranges))
-            for buf in node.read_writes.writes:
-                if not isinstance(buf, MemoryDep):
-                    buffer_names_grouping[buf.name]["writes"].append((node.get_name(), "not MemoryDep"))
-                else:
-                    buffer_names_grouping[buf.name]["writes"].append((node.get_name(), buf.index, buf.ranges))
-        filename = f"{text}.txt"
-        try:
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(f"\n{text}\n\n")
-                for buf, access in buffer_names_grouping.items():
-                    f.write(f'\n{buf}\n')
-                    if access["reads"]:
-                        f.write("reads:\n")
-                        for r in access["reads"]:
-                            f.write(f"  {r}\n")
-                    if access["writes"]:
-                        f.write("writes:\n")
-                        for w in access["writes"]:
-                            f.write(f"  {w}\n")
-        except IOError as e:
-            print(f"Error writing to file {filename}: {e}")
-        # for buf, access in buffer_names_grouping.items():
-        #     print('\n', buf)
-        #     if access["reads"]:
-        #         print("reads:")
-        #         for r in access["reads"]:
-        #             print(f"  {r}")
-        #     if access["writes"]:
-        #         print("writes:")
-        #         for w in access["writes"]:
-        #             print(f"  {w}")
-    ################################################################################
+    # ############################# WELDER #######################################
+    # def print_nodes_var_ranges(self, text) -> None:
+    #     # TODO
+    #     # print to txt file with name text
+    #     # e.g. pre_fusion_node.txt
+    #     buffer_names_grouping = defaultdict(lambda: {"reads": [], "writes": []})
+    #     for node in self.nodes:
+    #         if self.unfusable_node(node):
+    #             continue
+    #         for buf in node.read_writes.reads:
+    #             if not isinstance(buf, MemoryDep):
+    #                 buffer_names_grouping[buf.name]["reads"].append((node.get_name(), "not MemoryDep"))
+    #             else:
+    #                 buffer_names_grouping[buf.name]["reads"].append((node.get_name(), buf.index, buf.ranges))
+    #         for buf in node.read_writes.writes:
+    #             if not isinstance(buf, MemoryDep):
+    #                 buffer_names_grouping[buf.name]["writes"].append((node.get_name(), "not MemoryDep"))
+    #             else:
+    #                 buffer_names_grouping[buf.name]["writes"].append((node.get_name(), buf.index, buf.ranges))
+    #     filename = f"/{text}.txt"
+    #     try:
+    #         with open(get_debug_dir() + filename, 'w', encoding='utf-8') as f:
+    #             f.write(f"\n{text}\n\n")
+    #             for buf, access in buffer_names_grouping.items():
+    #                 f.write(f'\n{buf}\n')
+    #                 if access["reads"]:
+    #                     f.write("reads:\n")
+    #                     for r in access["reads"]:
+    #                         f.write(f"  {r}\n")
+    #                 if access["writes"]:
+    #                     f.write("writes:\n")
+    #                     for w in access["writes"]:
+    #                         f.write(f"  {w}\n")
+    #     except IOError as e:
+    #         print(f"Error writing to file {filename}: {e}")
+    #     # for buf, access in buffer_names_grouping.items():
+    #     #     print('\n', buf)
+    #     #     if access["reads"]:
+    #     #         print("reads:")
+    #     #         for r in access["reads"]:
+    #     #             print(f"  {r}")
+    #     #     if access["writes"]:
+    #     #         print("writes:")
+    #     #         for w in access["writes"]:
+    #     #             print(f"  {w}")
+    # ################################################################################
 
 class BaseScheduling:
     def __init__(self, scheduler: Optional[Scheduler]):

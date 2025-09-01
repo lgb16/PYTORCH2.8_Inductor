@@ -38,6 +38,9 @@ from .scheduler import (
     OutputNode,
     SchedulerNode,
 )
+from .dependencies import (
+    MemoryDep,
+)
 from .virtualized import V
 
 
@@ -528,6 +531,53 @@ class DebugFormatter:
         with self.fopen("ir_post_fusion.txt") as fd:
             fd.write(self._write_ir(nodes))
 
+    ############################# WELDER #######################################
+    def print_nodes_var_ranges(self, text, nodes: SchedulerNodeList) -> None:
+        # TODO
+        # print to txt file with name text
+        # e.g. pre_fusion_node.txt
+        buffer_names_grouping = collections.defaultdict(lambda: {"reads": [], "writes": []})
+        for node in nodes:
+            # if self.unfusable_node(node):
+            #     continue
+            for buf in node.read_writes.reads:
+                if not isinstance(buf, MemoryDep):
+                    buffer_names_grouping[buf.name]["reads"].append((node.get_name(), "not MemoryDep"))
+                else:
+                    buffer_names_grouping[buf.name]["reads"].append((node.get_name(), buf.index, buf.ranges))
+            for buf in node.read_writes.writes:
+                if not isinstance(buf, MemoryDep):
+                    buffer_names_grouping[buf.name]["writes"].append((node.get_name(), "not MemoryDep"))
+                else:
+                    buffer_names_grouping[buf.name]["writes"].append((node.get_name(), buf.index, buf.ranges))
+        filename = f"{text}.txt"
+        try:
+            with self.fopen(filename, 'w', encoding='utf-8') as f:
+                f.write(f"\n{text}\n\n")
+                for buf, access in buffer_names_grouping.items():
+                    f.write(f'\n{buf}\n')
+                    if access["reads"]:
+                        f.write("reads:\n")
+                        for r in access["reads"]:
+                            f.write(f"  {r}\n")
+                    if access["writes"]:
+                        f.write("writes:\n")
+                        for w in access["writes"]:
+                            f.write(f"  {w}\n")
+        except IOError as e:
+            print(f"Error writing to file {filename}: {e}")
+        # for buf, access in buffer_names_grouping.items():
+        #     print('\n', buf)
+        #     if access["reads"]:
+        #         print("reads:")
+        #         for r in access["reads"]:
+        #             print(f"  {r}")
+        #     if access["writes"]:
+        #         print("writes:")
+        #         for w in access["writes"]:
+        #             print(f"  {w}")
+    ################################################################################
+
     @staticmethod
     def _write_ir(nodes: SchedulerNodeList) -> str:
         buf = io.StringIO()
@@ -680,6 +730,10 @@ def log_ir_post_fusion(nodes: SchedulerNodeList) -> None:
 
     V.debug.ir_post_fusion(nodes)
 
+########################## WELDER ##############################
+def log_nodes_var_ranges(text, nodes: SchedulerNodeList) -> None:
+    V.debug.print_nodes_var_ranges(text, nodes)
+################################################################
 
 @dataclasses.dataclass
 class TensorMetadataHolder:
