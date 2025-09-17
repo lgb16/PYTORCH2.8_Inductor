@@ -60,6 +60,11 @@ class Dep(abc.ABC):
 
     def normalize_with_stride_order(self, prefix: str = "t") -> Self:
         return self
+    
+    ################################# WELDER ###################################
+    def apply_mapped_vars(self, mapped_vars, var_ranges) -> bool:
+        raise NotImplementedError
+    ############################################################################
 
 
 @dataclasses.dataclass(frozen=True)
@@ -194,6 +199,11 @@ class MemoryDep(Dep):
 
         assert set(order) == set(range(0, self.num_vars))
         return order
+    
+    # def apply_mapped_vars(self, mapped_vars, var_ranges) -> bool:
+    #     self.index = self.index.xreplace(mapped_vars)
+    #     self.var_names = var_ranges.keys()
+    #     self.size = var_ranges.values()
     #################################################################
 
     def get_offset(self) -> sympy.Expr:
@@ -278,6 +288,15 @@ class MemoryDep(Dep):
             return self.ranges
         vars: OrderedSet[sympy.Basic] = OrderedSet(self.index.free_symbols)
         return {var: size for var, size in zip(self.var_names, self.size) if var in vars}
+    
+    def set_new_var_ranges(self, _mapped_vars, _var_ranges):
+        return MemoryDep(
+            self.name,
+            self.index.xreplace(_mapped_vars),
+            var_names = tuple(_var_ranges.keys()),
+            size = tuple(_var_ranges.values()),
+            mode = self.mode,
+        )
     ########################################################################
 
     def get_numel(self) -> sympy.Expr:
@@ -518,6 +537,15 @@ class ReadWrites:
             ):
                 names.add(dep.name)
         return names
+    
+    def apply_mapped_vars(self, _mapped_vars, _var_ranges):
+        return ReadWrites(
+            OrderedSet(dep.set_new_var_ranges(_mapped_vars, _var_ranges) for dep in self.reads),
+            OrderedSet(dep.set_new_var_ranges(_mapped_vars, _var_ranges) for dep in self.writes),
+            self.index_exprs,
+            self.range_vars,
+            self.var_ranges,
+        )
     ###########################################################
 
 

@@ -33,6 +33,11 @@ from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.symbol import free_symbol_is_type, symbol_is_type, SymT
 from torch.utils._triton import has_triton
 
+############################# WELDER / ASTITCH #############################################
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+import copy
+########################################################################################
+
 from . import comms, config, dependencies, ir, metrics
 from .analyze_preserves_zero_mask import can_codegen_without_upcasts
 from .codegen.common import BackendFeature, get_scheduling_for_device, Kernel
@@ -67,6 +72,7 @@ from .utils import (
     is_output_of_multi_outputs_template,
     is_wait,
     sympy_product,
+    sympy_subs,
 )
 from .virtualized import V
 
@@ -76,6 +82,92 @@ fusion_log = torch._logging.getArtifactLogger(__name__, "fusion")
 loop_ordering_log = torch._logging.getArtifactLogger(__name__, "loop_ordering")
 
 PartitionType = list["BaseSchedulerNode"]
+
+
+################################## WELDER ######################################
+@functools.lru_cache
+def stride_at(index: sympy.Expr, var: sympy.Symbol):
+    if not index.has(var):
+        # see test_torchinductor_dynamic_shapes.py::test_full_boolean_dynamic_shapes_cpu
+        # which has tmp0 = ops.index_expr(s0 >= 1024, torch.bool) and fails below calculation.
+        # in this case, there is no dependencies between index and var.
+        return sympy.S.Zero
+    replacement = {var: var + 1}
+    new_index = sympy_subs(index, replacement)  # type: ignore[arg-type]
+    return sympy.simplify(new_index - index)
+
+
+@functools.lru_cache
+def simplify_index_in_vec_range(index: sympy.Expr, var: sympy.Expr, vec_length: int):
+    """
+    Simplifies the index expression within the range of a vectorized loop.
+    Given a vectorized loop variable `var` in the range of a loop with `vec_length`,
+    this function transforms the `index` into an equivalent form. It handles
+    simplifications for cases where `var` can be expressed as `vec_length * a + b`,
+    where `b` ranges from 0 to `vec_length - 1`. The function reduces occurrences
+    of `FloorDiv` and `ModularIndexing` in the `index` with best-effort optimizations.
+
+    NOTE:
+    The simplified index expression is intended for analysis purposes only, not
+    for code generation. It replaces `FloorDiv` and `ModularIndexing` with free variables
+    which are not dependent on the loop variable `var` in the vectorized range. Check
+    https://github.com/pytorch/pytorch/pull/117221#discussion_r1449746217 for more details.
+
+    Examples:
+    1. If `var` is `x3` and `vec_length` is 16, and `x3 = 16*a + b`, then
+       `FloorDiv(x3, div)` or `ModularIndexing(x3, div, mod)` becomes a free variable
+       when `div` is divisible by 16.
+    2. `ModularIndexing(x3, 1, mod)` can be simplified to `x3 + c` where `c` is a free
+       variable when `mod` is divisible by 16.
+    """
+
+    div_freevar_id = 0
+    mod_freevar_id = 0
+
+    def visit_indexing_div(divisor):
+        nonlocal div_freevar_id
+        result = FloorDiv(var, divisor)
+        if sympy.gcd(divisor, vec_length) == vec_length:
+            result = sympy.Symbol(f"{var}_div_c{div_freevar_id}")
+            div_freevar_id += 1
+        return result
+
+    def visit_modular_indexing(divisor, modulus):
+        nonlocal mod_freevar_id
+        result = ModularIndexing(var, divisor, modulus)
+        if sympy.gcd(divisor, vec_length) == vec_length:
+            result = sympy.Symbol(f"{var}_mod_c{mod_freevar_id}")
+            mod_freevar_id += 1
+        elif divisor == 1 and sympy.gcd(modulus, vec_length) == vec_length:
+            result = var + sympy.Symbol(f"{var}_mod_c{mod_freevar_id}")
+            mod_freevar_id += 1
+        return result
+
+    original_index = index
+
+    div = sympy.Wild("divisor", integer=True)
+    if index.has(FloorDiv):
+        index = index.replace(FloorDiv(var, div), visit_indexing_div)
+
+    mod = sympy.Wild("modulus", integer=True)
+    if index.has(ModularIndexing):
+        index = index.replace(ModularIndexing(var, div, mod), visit_modular_indexing)
+
+    index = sympy.simplify(index)
+    if index != original_index:
+        return simplify_index_in_vec_range(index, var, vec_length)
+
+    return index
+
+
+@functools.lru_cache
+def stride_at_vec_range(
+    index: sympy.Expr, var: sympy.Symbol, vec_length: Optional[int] = None
+):
+    if vec_length:
+        index = simplify_index_in_vec_range(index, var, vec_length)
+    return stride_at(index, var)
+###########################################################################
 
 
 @dataclasses.dataclass
@@ -893,6 +985,21 @@ class BaseSchedulerNode:
 
     def propagate_output_tile(self, tile_var_ranges: dict[str, dict[sympy.Symbol, sympy.Expr]]):
         return None
+
+    def apply_mapped_vars(self, _mapped_vars: dict[sympy.Expr, sympy.Expr], _var_ranges: dict[sympy.Expr, sympy.Expr]):
+        ## 1. Store current Dep and Loop_Body
+        if self.read_writes is None:
+            print("can't backup Dep : Dep is None")
+            return False
+        # if self._body is None:
+        #     print("can't backup Loop_Body : Loop_Body is None")
+        #     return False
+        self.read_writes_backup = copy.deepcopy(self.read_writes)
+        # self._body_backup = copy.deepcopy(self._body)
+        
+        ## 2. Apply map to Dep
+        self.read_writes = self.read_writes.apply_mapped_vars(_mapped_vars, _var_ranges)
+        ## 3. Apply map to Loop_Body
     #####################################################################################################
 
 
@@ -1297,7 +1404,7 @@ class SchedulerNode(BaseSchedulerNode):
             for key, value in self.read_writes.var_ranges.items()
         }
 
-        name_to_tile: Dict[str, Dict[sympy.Symbol, sympy.Expr]] = {}
+        name_to_tile: dict[str, dict[sympy.Symbol, sympy.Expr]] = {}
         for dep in self.read_writes.reads_and_writes():
             if not isinstance(dep, MemoryDep):
                 continue
@@ -1335,6 +1442,34 @@ class SchedulerNode(BaseSchedulerNode):
                     ## tile_range는 default_tile을 계산했기 떄문에 1 또는 tensor_size의 값만을 가짐(가정)
                     return None
         return default_tile_ranges
+
+    def apply_mapped_vars(self, _mapped_vars: dict[sympy.Expr, sympy.Expr], _var_ranges: dict[sympy.Expr, sympy.Expr]):
+        ## 1. Store current Dep and Loop_Body
+        if self.read_writes is None:
+            print("can't backup Dep : Dep is None")
+            return False
+        # if self._body is None:
+        #     print("can't backup Loop_Body : Loop_Body is None")
+        #     return False
+        self.read_writes_backup = copy.deepcopy(self.read_writes)
+        # self._body_backup = copy.deepcopy(self._body)
+        
+        ## 2. Apply map to Dep
+        self.read_writes = self.read_writes.apply_mapped_vars(_mapped_vars, _var_ranges)
+        ## 3. Apply map to Loop_Body
+
+    def restore_var_ranges(self):
+        if self.read_writes_backup is not None:
+            self.read_writes = self.read_writes_backup
+            self.read_writes_backup = None
+        else:
+            print("There is no Dep backup")
+
+        if self._body_backup is not None:
+            self._body = self._body_backup
+            self._body_backup = None
+        else:
+            print("There is no Loop_Body backup")
     ########################################################################################
 
 
@@ -1380,9 +1515,9 @@ def init_group_node(
 
 ############################ WELDER #############################
 def merge_tile_ranges(
-    name_to_tile_range_1: Dict[str, Dict[sympy.Symbol, sympy.Expr]],
-    name_to_tile_range_2: Dict[str, Dict[sympy.Symbol, sympy.Expr]],
-) -> Dict[str, Dict[sympy.Symbol, sympy.Expr]]:
+    name_to_tile_range_1: dict[str, dict[sympy.Symbol, sympy.Expr]],
+    name_to_tile_range_2: dict[str, dict[sympy.Symbol, sympy.Expr]],
+) -> dict[str, dict[sympy.Symbol, sympy.Expr]]:
     merged_range = {}
     merged_range.update(name_to_tile_range_1)
     
@@ -2247,6 +2382,10 @@ class Scheduler:
         self.logged_slow_fusion = OrderedSet[tuple[str, str]]()
         if config._pre_fusion_custom_pass is not None:
             self.nodes = config._pre_fusion_custom_pass(self.nodes)
+        #####################################################
+        # for node in self.nodes:
+        #     node = self.try_loop_split(node)
+        ####################################################
         self.nodes = self.fuse_nodes(self.nodes)
         if config._post_fusion_custom_pass is not None:
             self.nodes = config._post_fusion_custom_pass(self.nodes)
@@ -3783,8 +3922,8 @@ class Scheduler:
             # node1_strides = V.graph.sizevars.stride_hints(node1_dep.index, node1_ranges)
             node1_strides = dict(zip(node1_vars, V.graph.sizevars.stride_hints(node1_dep.index, node1_vars)))
 
-            node2_ranges = node1_dep.get_free_sym_ranges()
-            node2_vars = node1_ranges.keys()
+            node2_ranges = node2_dep.get_free_sym_ranges()
+            node2_vars = node2_ranges.keys()
             # node2_strides = V.graph.sizevars.stride_hints(node2_dep.index, node2_ranges)
             node2_strides = dict(zip(node2_vars, V.graph.sizevars.stride_hints(node2_dep.index, node2_vars)))
 
@@ -3806,9 +3945,9 @@ class Scheduler:
 
                 # Rule 1: Stride Mismatch -> Incompatible
                 if stride1 != stride2:
-                    print(f"Error: Stride mismatch. Cannot handle.")
-                    print(f"  - {node1.get_name()}: {var1} (stride={stride1})")
-                    print(f"  - {node2.get_name()}: {var2} (stride={stride2})")
+                    #print(f"Error: Stride mismatch. Cannot handle.")
+                    #print(f"  - {node1.get_name()}: {var1} (stride={stride1})")
+                    #print(f"  - {node2.get_name()}: {var2} (stride={stride2})")
                     return None
 
                 # Rule 2: Stride and Range Match -> Direct mapping
@@ -3831,7 +3970,7 @@ class Scheduler:
                         next_var, next_stride, next_range = node2_info[k]
                         prev_var, prev_stride, prev_range = node2_info[k-1]
                         if next_stride != prev_stride * prev_range:
-                            print("Error: Cannot merge non-contiguous variables in Node 2.")
+                            #print("Error: Cannot merge non-contiguous variables in Node 2.")
                             return None
                         
                         merged_range *= next_range
@@ -3843,7 +3982,7 @@ class Scheduler:
                         i += 1
                         j = k # Move j past all the merged variables
                     else:
-                        print(f"Error: Range mismatch after merge attempt for {var1} and {var2}.")
+                        #print(f"Error: Range mismatch after merge attempt for {var1} and {var2}.")
                         return None
 
                 else: # range2 > range1
@@ -3858,7 +3997,7 @@ class Scheduler:
                         next_var, next_stride, next_range = node1_info[k]
                         prev_var, prev_stride, prev_range = node1_info[k-1]
                         if next_stride != prev_stride * prev_range:
-                            print("Error: Cannot merge non-contiguous variables in Node 1.")
+                            #print("Error: Cannot merge non-contiguous variables in Node 1.")
                             return None
                         
                         merged_range *= next_range
@@ -3870,20 +4009,30 @@ class Scheduler:
                         j += 1
                         i = k # Move i past all the merged variables
                     else:
-                        print(f"Error: Range mismatch after merge attempt for {var1} and {var2}.")
+                        #print(f"Error: Range mismatch after merge attempt for {var1} and {var2}.")
                         return None
 
             # Check if all variables were consumed
             if i < len(node1_info) or j < len(node2_info):
-                print("Error: Nodes have a different number of effective dimensions.")
+                #print("Error: Nodes have a different number of effective dimensions.")
                 return None
 
             return mapped_vars
+
+        def reverse_key_value(_mapped_vars : dict):
+            if len(_mapped_vars.values()) != len(set(_mapped_vars.values())):
+                return None
+            return {value: key for key, value in _mapped_vars.items()}
+
         
         if any(
             n.is_cpu() for n in [node1, node2]
         ):
             return 0
+
+        #node1, node2 = self.try_loop_split([node1, node2])
+        node1 = self.try_loop_split(node1)
+        node2 = self.try_loop_split(node2)
 
         node1_buffer_names = node1.read_writes.buffer_names()
         node2_buffer_names = node2.read_writes.buffer_names()
@@ -3904,6 +4053,13 @@ class Scheduler:
             mapped_vars = compare_and_map_nodes(lhs_dep, rhs_dep)
             if mapped_vars is not None:
                 print(mapped_vars)
+                if lhs_dep.get_numel() <= rhs_dep.get_numel():
+                    node1.apply_mapped_vars(mapped_vars, rhs_dep.ranges)
+                else:
+                    mapped_vars=reverse_key_value(
+                        mapped_vars
+                    )
+                    node2.apply_mapped_vars(mapped_vars, lhs_dep.ranges)
 
             ################################ TODO ###############################
             ### Dep 에서 필요한 정보 위 함수에 넣기
@@ -5321,6 +5477,119 @@ class Scheduler:
     #     #         for w in access["writes"]:
     #     #             print(f"  {w}")
     # ################################################################################
+
+    ################################## WELDER #########################################
+    
+    def try_loop_split(self, node: SchedulerNode):
+        """
+        Apply loop split optimization.
+        When one of the indexing_exprs contains a division, we eliminate the division by splitting the loop
+        to avoid non-contiguous loads, subject to the following conditions:
+            1. No reduction and no mudular index for all nodes.
+            2. The indexing_exprs of all nodes contain only one (or more, but all the same) division,
+               where the divisor is an integer and not too small (the divisor > 8), the dividend is
+               one of the iter_vars, and this var, i.e. the dimension that needs to be split, is
+               contiguous in all other indexing_exprs.
+
+        For example, if the node's var_ranges: {z0: 2, z1: 9216, z2: 960} and indexing_exprs:
+        {'index0': 8847360*z0 + 960*z1 + z2, 'index1': 32*z0 + (z2//30), 'index2': z2},
+        we will split z2 -> 30*z2 + z3, then the node's var_ranges will be changed to
+        {z0: 2, z1: 9216, z2: 32, z3: 30} and indexing_exprs will be changed to
+        {'index0': 8847360*z0 + 960*z1 + 30*z2 + z3, 'index1': 32*z0 + z2, 'index2': 30*z2 + z3}.
+        """
+
+        # No reduction and no mudular
+        if (
+            ##len(node.group[1][1]) != 0
+            not isinstance(node, SchedulerNode)
+            or node.is_reduction()
+            or node.is_template()
+            or any(
+                expr.has(ModularIndexing) for expr in node._body.indexing_exprs.values()
+            )
+        ):
+            return node
+
+        split_var = None
+        split_number = None
+        num_div = 0
+        div_expr_ = None
+        match_div = False
+        matched_node = None
+
+        assert isinstance(node.node, ir.ComputedBuffer)
+        _, original_body, _ = node.node.get_default_sizes_body()
+        for name, expr in original_body.indexing_exprs.items():
+            for div_expr in expr.find(FloorDiv):
+                if (
+                    any(div_expr.has(var) for var in original_body.iter_vars)
+                    and div_expr != div_expr_
+                ):
+                    div_expr_ = div_expr
+                    num_div += 1
+                if num_div > 1:
+                    return node
+                if (
+                    isinstance(div_expr.args[1], sympy.core.numbers.Integer)
+                    and div_expr.args[0] in original_body.iter_vars
+                    and name is not None
+                    # and all(
+                    #     stride_at_vec_range(expr_, div_expr.args[0]) in (0, 1)
+                    #     for name_, expr_ in original_body.indexing_exprs.items()
+                    #     if name_ != name
+                    # )
+                    # and div_expr.args[1] > 8
+                ):
+                    split_var = div_expr.args[0]
+                    split_number = div_expr.args[1]
+                    match_div = True
+                    matched_node = node
+
+        # Only one node contains a division, and the split dimension is contiguous in all other indexing_exprs.
+        if not match_div:
+            return node
+
+        extra_indexing_constraints = None
+
+        def loop_split(sizes, body, vars):
+            index_size, reduce_size = sizes
+            index_vars, reduce_vars = vars
+            split_idx = index_vars.index(split_var)
+            new_index_size = index_size.copy()
+            new_index_size[split_idx] = index_size[split_idx] // split_number
+            new_index_size.insert(split_idx + 1, split_number)
+            (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
+                new_index_size, reduce_size, prefix="y"
+            )
+            iter_vars = new_index_vars.copy()
+            divisor_var = iter_vars.pop(split_idx + 1)
+            iter_vars[split_idx] = split_number * iter_vars[split_idx] + divisor_var
+            body = ir.LoopBody(
+                body, [iter_vars, reduce_vars], var_ranges, new_index_vars, reduce_vars
+            )
+            nonlocal extra_indexing_constraints
+            if not extra_indexing_constraints:
+                extra_indexing_constraints = (
+                    body.var_ranges,
+                    list(body.indexing_exprs.values()),
+                )
+            return (
+                (new_index_size, reduce_size),
+                body,
+                (new_index_vars, reduce_vars),
+            )
+
+        # Here decide the final loop order
+        if node == matched_node:
+            node.recompute_size_and_body(recompute_sizes_body_func=loop_split)
+        if node != matched_node:
+            node.recompute_size_and_body(
+                extra_indexing_constraints=extra_indexing_constraints,
+                recompute_sizes_body_func=loop_split,
+                )
+
+        return node
+    ####################################################################
 
 class BaseScheduling:
     def __init__(self, scheduler: Optional[Scheduler]):
