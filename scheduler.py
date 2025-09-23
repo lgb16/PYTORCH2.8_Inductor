@@ -1000,6 +1000,9 @@ class BaseSchedulerNode:
         ## 2. Apply map to Dep
         self.read_writes = self.read_writes.apply_mapped_vars(_mapped_vars, _var_ranges)
         ## 3. Apply map to Loop_Body
+    
+    def get_loop_with_buf(self, buffer_name):
+        return None
     #####################################################################################################
 
 
@@ -1170,6 +1173,51 @@ class SchedulerNode(BaseSchedulerNode):
             extra_indexing_constraints=extra_indexing_constraints,
             recompute_sizes_body_func=recompute_sizes_body_func,
         )
+
+    ################################# WELDER ##########################################
+    def _compute_attrs_with_cur_body(
+        self,
+        extra_indexing_constraints: Optional[tuple[dict[Any, Any], list[Any]]] = None,
+        recompute_sizes_body_func: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        assert isinstance(self.node, (ir.ComputedBuffer, ir.TemplateBuffer))
+        self._sizes, self._body = self.node.simplify_and_reorder_with_cur_body(
+            extra_indexing_constraints=extra_indexing_constraints,
+            recompute_sizes_body_func=recompute_sizes_body_func,
+            current_body=self._body
+        )
+
+        device = self.node.get_device_or_error()
+        group_fn = self.scheduler.get_backend(device).group_fn
+        self.group = (device, group_fn(self._sizes))
+
+        # Don't normalize since normalization will merge loops which
+        # makes it hard to decide new loop orders.
+        should_normalize = not config.loop_ordering_after_fusion or not is_gpu(
+            device.type
+        )
+
+        if isinstance(self.node, ir.TemplateBuffer):
+            self.set_read_writes(
+                self.node.extract_read_writes(normalize=should_normalize)
+            )
+        else:
+            self.set_read_writes(
+                dependencies.extract_read_writes(
+                    self._body, *self._sizes, normalize=should_normalize
+                )
+            )
+
+    def recompute_size_and_body_with_cur_body(
+        self,
+        extra_indexing_constraints: Optional[tuple[dict[Any, Any], list[Any]]] = None,
+        recompute_sizes_body_func: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        self._compute_attrs_with_cur_body(
+            extra_indexing_constraints=extra_indexing_constraints,
+            recompute_sizes_body_func=recompute_sizes_body_func,
+        )
+    ##############################################################################
 
     def refresh_dependencies(
         self, normalize: bool, need_clear_tiling_cache: bool
@@ -1470,6 +1518,9 @@ class SchedulerNode(BaseSchedulerNode):
             self._body_backup = None
         else:
             print("There is no Loop_Body backup")
+    
+    def get_loop_with_buf(self, buffer_name):
+        return [self._body]
     ########################################################################################
 
 
@@ -1802,6 +1853,13 @@ class FusedSchedulerNode(BaseSchedulerNode):
                 return None           
 
         return fused_tile_ranges
+    
+    def get_loop_with_buf(self, buffer_name):
+        out = []
+        for node in self.get_nodes():
+            if buffer_name in node.read_writes.buffer_names() and node._body is not None:
+                out.append(node._body)
+        return out
     #################################################################################
 
 
@@ -3913,26 +3971,28 @@ class Scheduler:
     def shared_data_with_match_index(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> int:
-        def compare_and_map_nodes(node1_dep, node2_dep):
+        def compare_and_map(base_loop: LoopBody, other_loop: LoopBody, buffer_name):
             # 1. Calculate strides for each variable
 
             # 2. Combine variable info and sort by stride
-            node1_ranges = node1_dep.get_free_sym_ranges()
-            node1_vars = node1_ranges.keys()
-            # node1_strides = V.graph.sizevars.stride_hints(node1_dep.index, node1_ranges)
-            node1_strides = dict(zip(node1_vars, V.graph.sizevars.stride_hints(node1_dep.index, node1_vars)))
+            base_index, base_ranges = base_loop.get_index_and_free_sym_range(buffer_name)
+            if base_index==None or base_ranges==None:
+                return None
+            base_vars = base_ranges.keys()
+            base_strides = dict(zip(base_vars, V.graph.sizevars.stride_hints(base_index, base_vars)))
 
-            node2_ranges = node2_dep.get_free_sym_ranges()
-            node2_vars = node2_ranges.keys()
-            # node2_strides = V.graph.sizevars.stride_hints(node2_dep.index, node2_ranges)
-            node2_strides = dict(zip(node2_vars, V.graph.sizevars.stride_hints(node2_dep.index, node2_vars)))
+            other_index, other_ranges = other_loop.get_index_and_free_sym_range(buffer_name)
+            if other_index==None or other_ranges==None:
+                return None
+            other_vars = other_ranges.keys()
+            other_strides = dict(zip(other_vars, V.graph.sizevars.stride_hints(other_index, other_vars)))
 
-            node1_info = sorted(
-                [(var, node1_strides[var], node1_ranges[var]) for var in node1_vars],
+            node2_info = sorted(
+                [(var, base_strides[var], base_ranges[var]) for var in base_vars],
                 key=lambda x: x[1]
             )
-            node2_info = sorted(
-                [(var, node2_strides[var], node2_ranges[var]) for var in node2_vars],
+            node1_info = sorted(
+                [(var, other_strides[var], other_ranges[var]) for var in other_vars],
                 key=lambda x: x[1]
             )
 
@@ -4034,37 +4094,97 @@ class Scheduler:
         node1 = self.try_loop_split(node1)
         node2 = self.try_loop_split(node2)
 
+
+        # 기준 노드 정하기
+        # horizon, vertical 여부
+        # vertical 의 경우, consumer와 producer중 어느쪽의 var_range가 더 큰지
+        # store하게 되는 var_ranges가 어떤 식으로 변화하게 될 지 교려 할 필요성
+        # 일단 당장은 var_range가 큰 쪽으로 맞추는 방향으로 (구현의 편의성 및 Llama에 적용 가능성)
+        # var_range에서 reduction_var는 제외
         node1_buffer_names = node1.read_writes.buffer_names()
         node2_buffer_names = node2.read_writes.buffer_names()
         # Fast path: no common buffers.
         common_buffer_names = node1_buffer_names & node2_buffer_names
         if not common_buffer_names:
             return 0
+        
+        if node1.group[1][0] < node2.group[1][0]:
+            base_node = node2
+            other_node = node1
+        else:
+            base_node = node1
+            other_node = node2
 
-        node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
-        node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
 
-        # Find the commons buffers that has different loop orders
-        candidates = []
+        # base_loop = base_node._body
+        # other_loop = other_node._body
+        # # 주의
+        # # 현재로서 Template에 대한 검사는 아래 조건으로 막힘 -> 기존 propagate의 결과 약화 가능성
+        # # 일단 결과만 먼저 내고, 추가적으로 구현, Dep 기반으로 먼저 찾고, 그걸 body로 확산 시키는 방법?
+        # if base_loop is None or other_loop is None:
+        #     return 0
+        mapped_vars : dict = None
+        base_loop : LoopBody = None
+        # node._body의 memoryUsage를 활용해서 공통 버퍼 구하기
         for buffer_name in common_buffer_names:
-            lhs_dep = node1_name2dep[buffer_name]
-            rhs_dep = node2_name2dep[buffer_name]
-            
-            mapped_vars = compare_and_map_nodes(lhs_dep, rhs_dep)
-            if mapped_vars is not None:
-                print(mapped_vars)
-                if lhs_dep.get_numel() <= rhs_dep.get_numel():
-                    node1.apply_mapped_vars(mapped_vars, rhs_dep.ranges)
+            # other_entrys = other_loop.get_entry_with_buf_name(entry.buffer_name)
+            # # 한 노드에서 하나의 버퍼에 여러번 접근하는 경우, fusion 불가 처리
+            # if len(other_entrys) == 0 or len(other_entrys) > 1:
+            #     continue
+            # other_entry = other_entrys[0]
+            base_loops = base_node.get_loop_with_buf(buffer_name)
+            other_loops = other_node.get_loop_with_buf(buffer_name)
+            if None in base_loops or None in other_loops:
+                continue
+            base_loop = base_loops[0]
+            for other_loop in other_loops:
+                _mapped_vars = compare_and_map(base_loop, other_loop, buffer_name)
+                if _mapped_vars is None:
+                    continue
+                if mapped_vars is None:
+                    mapped_vars = _mapped_vars
+                elif mapped_vars == _mapped_vars:
+                    continue
                 else:
-                    mapped_vars=reverse_key_value(
-                        mapped_vars
-                    )
-                    node2.apply_mapped_vars(mapped_vars, lhs_dep.ranges)
+                    return 0
+        if mapped_vars is None or base_loop is None:
+            return 0
+        print(mapped_vars)
+        self.try_apply_var_range(other_node, base_loop, mapped_vars)
 
-            ################################ TODO ###############################
-            ### Dep 에서 필요한 정보 위 함수에 넣기
-            ### 생성된 map 적용하기
-            ### 모든 dep에 전파 및 loop_body에 적용
+        # node1_buffer_names = node1.read_writes.buffer_names()
+        # node2_buffer_names = node2.read_writes.buffer_names()
+        # # Fast path: no common buffers.
+        # common_buffer_names = node1_buffer_names & node2_buffer_names
+        # if not common_buffer_names:
+        #     return 0
+
+        # node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
+        # node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
+
+        # # Find the commons buffers that has different loop orders
+        # candidates = []
+        # for buffer_name in common_buffer_names:
+        #     lhs_dep = node1_name2dep[buffer_name]
+        #     rhs_dep = node2_name2dep[buffer_name]
+            
+        #     mapped_vars = compare_and_map_nodes(lhs_dep, rhs_dep)
+        #     if mapped_vars is not None:
+        #         print(mapped_vars)
+        #         if lhs_dep.get_numel() <= rhs_dep.get_numel():
+        #             self.try_apply_var_range(node1, node2._body)
+        #             #node1.apply_mapped_vars(mapped_vars, rhs_dep.ranges)
+        #         else:
+        #             self.try_apply_var_range(node2, node1._body)
+        #             #mapped_vars=reverse_key_value(
+        #              #   mapped_vars
+        #             #)
+        #             #node2.apply_mapped_vars(mapped_vars, lhs_dep.ranges)
+
+        #     ################################ TODO ###############################
+        #     ### Dep 에서 필요한 정보 위 함수에 넣기
+        #     ### 생성된 map 적용하기
+        #     ### 모든 dep에 전파 및 loop_body에 적용
         
         return self.score_fusion_memory_with_index(node1, node2)
     #######################################################################################
@@ -5588,6 +5708,75 @@ class Scheduler:
                 recompute_sizes_body_func=loop_split,
                 )
 
+        return node
+
+
+    def try_apply_var_range(self, node: BaseSchedulerNode, other: LoopBody, mapped_vars):
+        # var_range가 node에 적용하기에 타당한지 확인하는 과정
+        # recompute_size_and_body에 넘겨줄 def hook func 생성
+        extra_indexing_constraints = None
+
+        def apply_var_range(sizes, body, vars):
+            index_size, reduce_size = sizes
+            index_vars, reduce_vars = vars
+
+            #TODO : var_range를 필요에 맞게 적용하는 로직 구현
+            # split_idx = index_vars.index(split_var)
+            # new_index_size = index_size.copy()
+            # new_index_size[split_idx] = index_size[split_idx] // split_number
+            # new_index_size.insert(split_idx + 1, split_number)
+            # (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
+            #     new_index_size, reduce_size, prefix="y"
+            # )
+            # iter_vars = new_index_vars.copy()
+            # divisor_var = iter_vars.pop(split_idx + 1)
+            # iter_vars[split_idx] = split_number * iter_vars[split_idx] + divisor_var
+            other_index_size, other_reduce_size = other.sizes
+
+
+            (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
+                other_index_size, other_reduce_size, prefix="y"
+            )
+            iter_vars = [mapped_vars[var] for var in index_vars]
+            new_iter_vars = []
+
+            for expr in iter_vars:
+                subs_map = {}
+                
+                for s in expr.free_symbols:
+                    if s.name.startswith('p'):
+                        new_name = 'y' + s.name[1:]
+                        new_s = dependencies.sympy_index_symbol(new_name)
+                        subs_map[s] = new_s
+                        
+                new_expr = expr.subs(subs_map)
+                new_iter_vars.append(new_expr)
+            reduce_vars = other.reduce_vars
+            # var_ranges = other.var_ranges
+            # new_index_vars = []
+            # new_index_size = other.sizes[0]
+            # for vars in iter_vars:
+            #     for symbol in vars.free_symbols:
+            #         new_index_vars.append(symbol) 
+##########################################################################################
+            
+            body = ir.LoopBody(
+                body, [new_iter_vars, reduce_vars], var_ranges, new_index_vars, reduce_vars
+            )
+            nonlocal extra_indexing_constraints
+            if not extra_indexing_constraints:
+                extra_indexing_constraints = (
+                    body.var_ranges,
+                    list(body.indexing_exprs.values()),
+                )
+            return (
+                (other_index_size, reduce_size),
+                body,
+                (new_index_vars, reduce_vars),
+            )
+        # recompute 호출
+        for _node in node.get_nodes():
+            _node.recompute_size_and_body_with_cur_body(recompute_sizes_body_func=apply_var_range)
         return node
     ####################################################################
 

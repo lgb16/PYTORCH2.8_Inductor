@@ -4471,6 +4471,123 @@ class ComputedBuffer(OperationBuffer):
         )
         return (iter_ranges, reduce_ranges), body
 
+    ############################## WELDER ##################################
+    def simplify_and_reorder_with_cur_body(
+        self,
+        extra_indexing_constraints: Optional[tuple[dict[Any, Any], list[Any]]] = None,
+        recompute_sizes_body_func: Optional[Callable[..., Any]] = None,
+        current_body: LoopBody = None
+    ) -> tuple[tuple[list[sympy.Expr], list[sympy.Expr]], LoopBody]:
+        """
+        This is a main place where we do loop transformations in a
+        backend-agnostic way.
+
+        Here we:
+            1) Remove any 1 dimensions
+            2) Fuse contiguous dimensions together
+            3) Reorder dimensions based on stride orders
+
+        Optional argument extra_indexing_constraints can be used to append additional
+        indexing expressions to existing ones derived from buffer's body. This can be useful
+        to fuse scheduler nodes with compatible ranges, e.g. (s0*s1*...,) and (s0, s1, s2, ...)
+        on CPU by preventing indexing simplifications and obtaining index/reduce ranges for
+        the scheduler node compatible with other nodes.
+        Optional argument recompute_sizes_body_func can be used to recompute sizes and body
+        on the 'current' body. This can be useful to append additional loop transformations.
+        """
+
+        index_size, reduce_size = current_body.sizes
+        index_vars, reduce_vars = current_body.vars
+        body = current_body
+
+        if recompute_sizes_body_func:
+            (
+                (index_size, reduce_size),
+                body,
+                (index_vars, reduce_vars),
+            ) = recompute_sizes_body_func(
+                (index_size, reduce_size), body, (index_vars, reduce_vars)
+            )
+
+        index_formulas = [*body.indexing_exprs.values()]
+        if extra_indexing_constraints is not None:
+            assert (
+                isinstance(extra_indexing_constraints, tuple)
+                and len(extra_indexing_constraints) == 2
+            )
+            extra_indexing_ranges, extra_indexing_expr = extra_indexing_constraints
+            assert isinstance(extra_indexing_ranges, dict)
+            assert isinstance(extra_indexing_expr, list)
+            assert all(isinstance(f, Expr) for f in extra_indexing_expr)
+
+            expected_var_ranges = body.var_ranges
+            assert expected_var_ranges == extra_indexing_ranges, (
+                expected_var_ranges,
+                extra_indexing_ranges,
+            )
+            # remove already existing expressions
+            extra_indexing_expr = [
+                e for e in extra_indexing_expr if e not in index_formulas
+            ]
+            index_formulas += extra_indexing_expr
+
+        memory_addrs = [*body.get_write_exprs()]
+        if not V.graph.has_feature(self, BackendFeature.PREFER_STORE_LOOP_ORDER):
+            memory_addrs.extend(body.get_read_exprs())
+
+        def simplify_and_reorder(x_vars, support_vars, sizes, simplify_loops):  # type: ignore[no-untyped-def]
+            sizes, reindex0, reindex1 = self._apply_loop_reordering(
+                x_vars, support_vars, sizes, memory_addrs
+            )
+            # for NHWC: reindex0([0,1,2,3]) = [0,2,3,1], reindex1([0,1,2,3]) = [0,3,2,1]
+            x_vars = reindex0(x_vars)
+
+            if simplify_loops:
+                sizes, reindex2, _prune = V.graph.sizevars._simplify_loops(
+                    x_vars,
+                    sizes,
+                    index_prevent_reordering(index_formulas, x_vars, sizes),
+                )
+                reindex = fuse_reindexing(reindex1, reindex2)
+            else:
+                reindex = reindex1
+            return sizes, reindex, reindex1
+
+        support_vars = index_vars + reduce_vars
+        should_merge_loops = (
+            not is_gpu(get_device_type(self)) or not config.loop_ordering_after_fusion
+        )
+        iter_ranges, iter_reindex, _ = simplify_and_reorder(
+            index_vars,
+            support_vars,
+            index_size,
+            should_merge_loops,
+        )
+
+        # Like iteration dimensions, we may also want to delay merging reduction dimensions.
+        # E.g., if we reduce a tensor [M, N, K] for its M and N dimensions followed by a pointwise
+        # kernel, merging M and N dimension too early makes it hard to decide what loop order
+        # we should pick for the piontwise kernel so that it is fusible with the reduction.
+        reduce_ranges, reduce_reindex, _ = simplify_and_reorder(
+            reduce_vars, support_vars, reduce_size, should_merge_loops
+        )
+
+        # retrace the loop body with simplification and reordering applied
+        (iter_vars, reduce_vars), var_ranges = dependencies.index_vars_no_squeeze(
+            iter_ranges,
+            reduce_ranges,
+            prefix="p",
+        )
+        body = LoopBody(
+            body,
+            [iter_reindex(iter_vars), reduce_reindex(reduce_vars)],
+            var_ranges,
+            iter_vars,
+            reduce_vars,
+        )
+        return (iter_ranges, reduce_ranges), body
+    ###############################################################################
+
     @staticmethod
     def _apply_loop_reordering(  # type: ignore[no-untyped-def]
         index_vars,

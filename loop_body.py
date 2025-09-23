@@ -352,6 +352,34 @@ class LoopBody:
         )
         return "\n".join(lines)
 
+    ######################## WELDER #############################
+    def get_all_memory_entry(self):
+        return itertools.chain(
+            self.memory_usage[MemoryUsageType.LOAD],
+            self.memory_usage[MemoryUsageType.LOAD_SEED],
+            self.memory_usage[MemoryUsageType.STORE],
+            self.memory_usage[MemoryUsageType.STORE_REDUCTION],
+        )
+
+    def get_entry_with_buf_name(self, buffer_name):
+        out = []
+        for entry in self.get_all_memory_entry():
+            if entry.buffer_name == buffer_name:
+                out.append(entry)
+        return out
+    
+    def get_index_and_free_sym_range(self, buffer_name):
+        entrys = self.get_entry_with_buf_name(buffer_name)
+        if len(entrys) == 0 or len(entrys) > 1:
+            return None, None
+        index_name = entrys[0].index_name
+        index = self.indexing_exprs[index_name]
+        free_vars = index.free_symbols
+        free_vars_ranges = {var: size for var, size in self.var_ranges.items() if var in free_vars}
+        return index, free_vars_ranges
+
+    ############################################################
+
     def is_memory_copy(self) -> bool:
         """
         True of this contains only a single loads and store.
