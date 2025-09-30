@@ -338,6 +338,27 @@ def list_mode_options(
             "triton.cudagraphs": True,
             "coordinate_descent_tuning": True,
         },
+        ######### WELDER ###########
+        # enable max-autotune + WELDER-LIKE fusion
+        "max-fusion": {
+            "max_autotune": True,
+            "triton.cudagraphs": True,
+            "coordinate_descent_tuning": True,
+            "loop_ordering_after_fusion": True,
+            "common_indexing_fusion": True,
+            "force_matching_index": True,
+            "loop_split_index_matching": True,
+            "skip_compare_normalized_dep": True,
+        },
+        "max-fusion-no-cudagraphs": {
+            "max_autotune": True,
+            "coordinate_descent_tuning": True,
+            "loop_ordering_after_fusion": True,
+            "common_indexing_fusion": True,
+            "force_matching_index": True,
+            "loop_split_index_matching": True,
+            "skip_compare_normalized_dep": True,
+        }
     }
     try:
         return mode_options[mode] if mode else mode_options
