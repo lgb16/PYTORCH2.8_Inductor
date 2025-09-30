@@ -671,6 +671,7 @@ debug_index_asserts = False
 # loop_ordering_after_fusion also useful
 common_indexing_fusion = False
 force_matching_index = False
+loop_split_index_matching = False
 skip_compare_normalized_dep = False
 
 # For Debugging

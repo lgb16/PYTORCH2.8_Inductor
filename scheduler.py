@@ -1000,6 +1000,9 @@ class BaseSchedulerNode:
         ## 2. Apply map to Dep
         self.read_writes = self.read_writes.apply_mapped_vars(_mapped_vars, _var_ranges)
         ## 3. Apply map to Loop_Body
+    
+    def get_loop_with_buf(self, buffer_name):
+        return None
     #####################################################################################################
 
 
@@ -1170,6 +1173,51 @@ class SchedulerNode(BaseSchedulerNode):
             extra_indexing_constraints=extra_indexing_constraints,
             recompute_sizes_body_func=recompute_sizes_body_func,
         )
+
+    ################################# WELDER ##########################################
+    def _compute_attrs_with_cur_body(
+        self,
+        extra_indexing_constraints: Optional[tuple[dict[Any, Any], list[Any]]] = None,
+        recompute_sizes_body_func: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        assert isinstance(self.node, (ir.ComputedBuffer, ir.TemplateBuffer))
+        self._sizes, self._body = self.node.simplify_and_reorder_with_cur_body(
+            extra_indexing_constraints=extra_indexing_constraints,
+            recompute_sizes_body_func=recompute_sizes_body_func,
+            current_body=self._body
+        )
+
+        device = self.node.get_device_or_error()
+        group_fn = self.scheduler.get_backend(device).group_fn
+        self.group = (device, group_fn(self._sizes))
+
+        # Don't normalize since normalization will merge loops which
+        # makes it hard to decide new loop orders.
+        should_normalize = not config.loop_ordering_after_fusion or not is_gpu(
+            device.type
+        )
+
+        if isinstance(self.node, ir.TemplateBuffer):
+            self.set_read_writes(
+                self.node.extract_read_writes(normalize=should_normalize)
+            )
+        else:
+            self.set_read_writes(
+                dependencies.extract_read_writes(
+                    self._body, *self._sizes, normalize=should_normalize
+                )
+            )
+
+    def recompute_size_and_body_with_cur_body(
+        self,
+        extra_indexing_constraints: Optional[tuple[dict[Any, Any], list[Any]]] = None,
+        recompute_sizes_body_func: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        self._compute_attrs_with_cur_body(
+            extra_indexing_constraints=extra_indexing_constraints,
+            recompute_sizes_body_func=recompute_sizes_body_func,
+        )
+    ##############################################################################
 
     def refresh_dependencies(
         self, normalize: bool, need_clear_tiling_cache: bool
@@ -1470,6 +1518,9 @@ class SchedulerNode(BaseSchedulerNode):
             self._body_backup = None
         else:
             print("There is no Loop_Body backup")
+    
+    def get_loop_with_buf(self, buffer_name):
+        return [self._body]
     ########################################################################################
 
 
@@ -1802,6 +1853,13 @@ class FusedSchedulerNode(BaseSchedulerNode):
                 return None           
 
         return fused_tile_ranges
+    
+    def get_loop_with_buf(self, buffer_name):
+        out = []
+        for node in self.get_nodes():
+            if buffer_name in node.read_writes.buffer_names() and node._body is not None:
+                out.append(node._body)
+        return out
     #################################################################################
 
 
@@ -3423,19 +3481,37 @@ class Scheduler:
             node1 = self.get_fused_node(node1)
             node2 = self.get_fused_node(node2)
 
-            if self.can_fuse(node1, node2) and not self.will_fusion_create_cycle(
-                node1, node2
-            ):
-                speedup = self.speedup_by_fusion(node1, node2)
-                if callable(speedup):
-                    pending_fusions[node1] = (speedup, node1, node2)
-                    pending_fusions[node2] = (speedup, node1, node2)
-                    continue
+            if config.common_indexing_fusion and config.force_matching_index:
+                if self.can_fuse_semi(node1, node2) and not self.will_fusion_create_cycle(
+                    node1, node2
+                ):
+                    if not self.try_match_var_ranges(node1, node2):
+                        continue
+                        # backup_node_info(node1, node2)
+                    speedup = self.speedup_by_fusion(node1, node2)
+                    if callable(speedup):
+                        pending_fusions[node1] = (speedup, node1, node2)
+                        pending_fusions[node2] = (speedup, node1, node2)
+                        continue
 
-                if not speedup:
-                    continue
+                    if not speedup:
+                        continue
 
-                fuse_two_nodes(node1, node2)
+                    fuse_two_nodes(node1, node2)
+            else:
+                if self.can_fuse(node1, node2) and not self.will_fusion_create_cycle(
+                    node1, node2
+                ):
+                    speedup = self.speedup_by_fusion(node1, node2)
+                    if callable(speedup):
+                        pending_fusions[node1] = (speedup, node1, node2)
+                        pending_fusions[node2] = (speedup, node1, node2)
+                        continue
+
+                    if not speedup:
+                        continue
+
+                    fuse_two_nodes(node1, node2)
 
         seen_pair_speedup_fn: OrderedSet[Callable[[], bool]] = OrderedSet()
         for is_speedup_fn, node_key1, node_key2 in pending_fusions.values():
@@ -3530,13 +3606,24 @@ class Scheduler:
                         continue
                     seen.add(key)
 
-                    if self.can_fuse(node1, node2):
-                        possible_fusions.append(key)
-                    elif (node2.is_template() or node2.is_foreach()) and self.can_fuse(
-                        node2, node1
-                    ):
-                        # foreach fusions and epilogue fusions are order dependent
-                        possible_fusions.append((node2, node1))
+                    ######################## WELDER ########################################
+                    if config.common_indexing_fusion and config.force_matching_index:
+                        if self.can_fuse_semi(node1, node2):
+                            possible_fusions.append(key)
+                        elif (node2.is_template() or node2.is_foreach()) and self.can_fuse_semi(
+                            node2, node1
+                        ):
+                            # foreach fusions and epilogue fusions are order dependent
+                            possible_fusions.append((node2, node1))
+                    ################################################################
+                    else:
+                        if self.can_fuse(node1, node2):
+                            possible_fusions.append(key)
+                        elif (node2.is_template() or node2.is_foreach()) and self.can_fuse(
+                            node2, node1
+                        ):
+                            # foreach fusions and epilogue fusions are order dependent
+                            possible_fusions.append((node2, node1))
 
         buffer_names_grouping = collections.defaultdict(list)
         for node in nodes:
@@ -3913,64 +4000,59 @@ class Scheduler:
     def shared_data_with_match_index(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> int:
-        def compare_and_map_nodes(node1_dep, node2_dep):
-            # 1. Calculate strides for each variable
+        def compare_and_map(base_loop: LoopBody, other_loop: LoopBody, buffer_name):
+            # mapping var in index(free_symbols)
+            base_index, base_ranges = base_loop.get_index_and_free_sym_range(buffer_name)
+            if base_index==None or base_ranges==None:
+                return None
+            base_vars = base_ranges.keys()
+            base_strides = dict(zip(base_vars, V.graph.sizevars.stride_hints(base_index, base_vars)))
 
-            # 2. Combine variable info and sort by stride
-            node1_ranges = node1_dep.get_free_sym_ranges()
-            node1_vars = node1_ranges.keys()
-            # node1_strides = V.graph.sizevars.stride_hints(node1_dep.index, node1_ranges)
-            node1_strides = dict(zip(node1_vars, V.graph.sizevars.stride_hints(node1_dep.index, node1_vars)))
+            other_index, other_ranges = other_loop.get_index_and_free_sym_range(buffer_name)
+            if other_index==None or other_ranges==None:
+                return None
+            other_vars = other_ranges.keys()
+            other_strides = dict(zip(other_vars, V.graph.sizevars.stride_hints(other_index, other_vars)))
 
-            node2_ranges = node2_dep.get_free_sym_ranges()
-            node2_vars = node2_ranges.keys()
-            # node2_strides = V.graph.sizevars.stride_hints(node2_dep.index, node2_ranges)
-            node2_strides = dict(zip(node2_vars, V.graph.sizevars.stride_hints(node2_dep.index, node2_vars)))
-
-            node1_info = sorted(
-                [(var, node1_strides[var], node1_ranges[var]) for var in node1_vars],
-                key=lambda x: x[1]
-            )
-            node2_info = sorted(
-                [(var, node2_strides[var], node2_ranges[var]) for var in node2_vars],
-                key=lambda x: x[1]
-            )
-
-            # 3. Iterate and compare the sorted variables
             mapped_vars = {}
+
+            # if base_index.has(ModularIndexing) or other_index.has(ModularIndexing):
+            #     # simple matching
+            #     # var의 순서를 변경하는 정도로만 match 시도
+            #     # ModularIndexing에 대한 handling 문제
+            #     return mapped_vars
+                
+
+            node2_info = sorted(
+                [(var, base_strides[var], base_ranges[var]) for var in base_vars],
+                key=lambda x: x[1]
+            )
+            node1_info = sorted(
+                [(var, other_strides[var], other_ranges[var]) for var in other_vars],
+                key=lambda x: x[1]
+            )
+
             i, j = 0, 0
             while i < len(node1_info) and j < len(node2_info):
                 var1, stride1, range1 = node1_info[i]
                 var2, stride2, range2 = node2_info[j]
 
-                # Rule 1: Stride Mismatch -> Incompatible
                 if stride1 != stride2:
-                    #print(f"Error: Stride mismatch. Cannot handle.")
-                    #print(f"  - {node1.get_name()}: {var1} (stride={stride1})")
-                    #print(f"  - {node2.get_name()}: {var2} (stride={stride2})")
                     return None
-
-                # Rule 2: Stride and Range Match -> Direct mapping
                 if range1 == range2:
                     mapped_vars[var1] = var2
                     i += 1
                     j += 1
                     continue
-
-                # Rule 3: Stride Match, Range Mismatch -> Attempt to merge
                 elif range1 > range2:
-                    # Node 2 has the smaller range, so we try to merge its variables
                     target_range = range1
                     merged_range = range2
                     vars_to_merge = [var2]
                     k = j + 1
-                    
                     while merged_range < target_range and k < len(node2_info):
-                        # Check if the next variable is contiguous in memory
                         next_var, next_stride, next_range = node2_info[k]
                         prev_var, prev_stride, prev_range = node2_info[k-1]
                         if next_stride != prev_stride * prev_range:
-                            #print("Error: Cannot merge non-contiguous variables in Node 2.")
                             return None
                         
                         merged_range *= next_range
@@ -3980,24 +4062,20 @@ class Scheduler:
                     if merged_range == target_range:
                         mapped_vars[var1] = sum(vars_to_merge)
                         i += 1
-                        j = k # Move j past all the merged variables
+                        j = k
                     else:
-                        #print(f"Error: Range mismatch after merge attempt for {var1} and {var2}.")
                         return None
 
-                else: # range2 > range1
-                    # Node 1 has the smaller range, so we try to merge its variables
+                else:
                     target_range = range2
                     merged_range = range1
                     vars_to_merge = [var1]
                     k = i + 1
                     
                     while merged_range < target_range and k < len(node1_info):
-                        # Check if the next variable is contiguous in memory
                         next_var, next_stride, next_range = node1_info[k]
                         prev_var, prev_stride, prev_range = node1_info[k-1]
                         if next_stride != prev_stride * prev_range:
-                            #print("Error: Cannot merge non-contiguous variables in Node 1.")
                             return None
                         
                         merged_range *= next_range
@@ -4007,15 +4085,79 @@ class Scheduler:
                     if merged_range == target_range:
                         mapped_vars[sum(vars_to_merge)] = var2
                         j += 1
-                        i = k # Move i past all the merged variables
+                        i = k
                     else:
-                        #print(f"Error: Range mismatch after merge attempt for {var1} and {var2}.")
                         return None
 
-            # Check if all variables were consumed
             if i < len(node1_info) or j < len(node2_info):
-                #print("Error: Nodes have a different number of effective dimensions.")
                 return None
+
+            # 2. map var not in free_symbols
+            # 현재는 몇가지 가정하에 단순하게 구현
+            #  - 두 var_ranges가 같지 않다면 한쪽이 다른쪽의 n배만큼 차이가 날 것(n is int)
+            #  - free_symbols에 포함되지 않는 var들 중에서 n배 차이나는 var가 하나 존재할 것
+            # 더 단순한 구현
+            #  - free_symbols가 아닌 var이 1개인 경우에만 handiling : n배이거나, 같거나
+            #  - 경우의 수
+            #  - base {d1 : 32} , other {d1 : 8} -> {d1 : d1//4} 로 mapping
+            #  - base {d1 : 8, d2 : 4} , other {d1 : 8} -> {d1 : d1} 으로 mapping
+            #  - base {d1 : 4, d2 : 2} , other {d1 : 8} -> {d1 : d1*2 + d2} 로 mapping
+            def create_special_map(base_vars: dict, other_vars: dict) -> dict:
+                base_keys = list(base_vars.keys())
+                other_keys = list(other_vars.keys())
+
+                if len(base_vars) == 1 and len(other_vars) == 1:
+                    base_var, base_size = base_keys[0], base_vars[base_keys[0]]
+                    other_var, other_size = other_keys[0], other_vars[other_keys[0]]
+                    
+                    if base_var == other_var and base_size % other_size == 0:
+                        ratio = base_size // other_size
+                        if ratio == 1:
+                            return {other_var: base_var}
+                        return {other_var: FloorDiv(base_var, ratio)}
+
+                if len(other_vars) == 1 and len(base_vars) > 1:
+                    other_var, other_size = other_keys[0], other_vars[other_keys[0]]
+                    total_base_size = math.prod(base_vars.values())
+
+                    if total_base_size == other_size:
+                        sorted_base_items = sorted(base_vars.items(), key=lambda item: str(item[0]))
+                        
+                        expression = 0
+                        num_base_vars = len(sorted_base_items)
+                        for i in range(num_base_vars):
+                            current_var, _ = sorted_base_items[i]
+                            
+                            coefficient = 1
+                            if i < num_base_vars - 1:
+                                subsequent_sizes = [item[1] for item in sorted_base_items[i+1:]]
+                                coefficient = math.prod(subsequent_sizes)
+                            
+                            expression += current_var * coefficient
+                        
+                        return {other_var: expression}
+
+                is_subset = all(
+                    var in base_vars and base_vars[var] == size
+                    for var, size in other_vars.items()
+                )
+                if is_subset:
+                    return {var: var for var in other_vars.keys()}
+
+                return {}
+
+            base_non_free_range = base_loop.get_non_free_symbols_range(buffer_name)
+            other_non_free_range = other_loop.get_non_free_symbols_range(buffer_name)
+            if len(other_non_free_range) > 1:
+                #print("Can not create var_map : ", node1.get_name(),"-", node1.get_ranges(), ", ", node2.get_name(), "-", node2.get_ranges())
+                return None
+            elif len(other_non_free_range) == 0:
+                pass
+            else:
+                non_free_var_map = create_special_map(base_non_free_range, other_non_free_range)
+                if not non_free_var_map:
+                    return None
+                mapped_vars = mapped_vars | non_free_var_map
 
             return mapped_vars
 
@@ -4031,9 +4173,14 @@ class Scheduler:
             return 0
 
         #node1, node2 = self.try_loop_split([node1, node2])
-        node1 = self.try_loop_split(node1)
-        node2 = self.try_loop_split(node2)
 
+
+        # 기준 노드 정하기
+        # horizon, vertical 여부
+        # vertical 의 경우, consumer와 producer중 어느쪽의 var_range가 더 큰지
+        # store하게 되는 var_ranges가 어떤 식으로 변화하게 될 지 교려 할 필요성
+        # 일단 당장은 var_range가 큰 쪽으로 맞추는 방향으로 (구현의 편의성 및 Llama에 적용 가능성)
+        # var_range에서 reduction_var는 제외
         node1_buffer_names = node1.read_writes.buffer_names()
         node2_buffer_names = node2.read_writes.buffer_names()
         # Fast path: no common buffers.
@@ -4041,32 +4188,97 @@ class Scheduler:
         if not common_buffer_names:
             return 0
 
-        node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
-        node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
-
-        # Find the commons buffers that has different loop orders
-        candidates = []
-        for buffer_name in common_buffer_names:
-            lhs_dep = node1_name2dep[buffer_name]
-            rhs_dep = node2_name2dep[buffer_name]
-            
-            mapped_vars = compare_and_map_nodes(lhs_dep, rhs_dep)
-            if mapped_vars is not None:
-                print(mapped_vars)
-                if lhs_dep.get_numel() <= rhs_dep.get_numel():
-                    node1.apply_mapped_vars(mapped_vars, rhs_dep.ranges)
-                else:
-                    mapped_vars=reverse_key_value(
-                        mapped_vars
-                    )
-                    node2.apply_mapped_vars(mapped_vars, lhs_dep.ranges)
-
-            ################################ TODO ###############################
-            ### Dep 에서 필요한 정보 위 함수에 넣기
-            ### 생성된 map 적용하기
-            ### 모든 dep에 전파 및 loop_body에 적용
+        # template 전용 pass
+        # 추후 구현 필요
+        # 둘다 Template인 경우, 0반환
+        # 둘중 하나가 Template인 경우, Template을 기준으로 range 맞추기?
+        if node1.is_template() or node2.is_template():
+            return 0
         
-        return self.score_fusion_memory_with_index(node1, node2)
+        if node1.group[1][0] < node2.group[1][0]:
+            base_node = node2
+            other_node = node1
+        else:
+            base_node = node1
+            other_node = node2
+
+
+        # base_loop = base_node._body
+        # other_loop = other_node._body
+        # # 주의
+        # # 현재로서 Template에 대한 검사는 아래 조건으로 막힘 -> 기존 propagate의 결과 약화 가능성
+        # # 일단 결과만 먼저 내고, 추가적으로 구현, Dep 기반으로 먼저 찾고, 그걸 body로 확산 시키는 방법?
+        # if base_loop is None or other_loop is None:
+        #     return 0
+        mapped_vars : dict = None
+        base_loop : LoopBody = None
+        # node._body의 memoryUsage를 활용해서 공통 버퍼 구하기
+        for buffer_name in common_buffer_names:
+            # other_entrys = other_loop.get_entry_with_buf_name(entry.buffer_name)
+            # # 한 노드에서 하나의 버퍼에 여러번 접근하는 경우, fusion 불가 처리
+            # if len(other_entrys) == 0 or len(other_entrys) > 1:
+            #     continue
+            # other_entry = other_entrys[0]
+            base_loops = base_node.get_loop_with_buf(buffer_name)
+            other_loops = other_node.get_loop_with_buf(buffer_name)
+            if None in base_loops or None in other_loops:
+                continue
+            base_loop = base_loops[0]
+            for other_loop in other_loops:
+                _mapped_vars = compare_and_map(base_loop, other_loop, buffer_name)
+                if _mapped_vars is None:
+                    continue
+                if mapped_vars is None:
+                    mapped_vars = _mapped_vars
+                elif mapped_vars == _mapped_vars:
+                    continue
+                else:
+                    return 0
+        if mapped_vars is None or base_loop is None:
+            return 0
+        # print(mapped_vars)
+        self.try_apply_var_range(other_node, base_loop, mapped_vars)
+        score = self.score_fusion_memory_with_index(node1, node2)
+        if score == 0 and config.loop_split_index_matching:
+            node1 = self.try_loop_split(node1)
+            node2 = self.try_loop_split(node2)
+            self.shared_data_with_match_index(node1, node2)
+            score = self.score_fusion_memory_with_index(node1, node2)
+        # node1_buffer_names = node1.read_writes.buffer_names()
+        # node2_buffer_names = node2.read_writes.buffer_names()
+        # # Fast path: no common buffers.
+        # common_buffer_names = node1_buffer_names & node2_buffer_names
+        # if not common_buffer_names:
+        #     return 0
+
+        # node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
+        # node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
+
+        # # Find the commons buffers that has different loop orders
+        # candidates = []
+        # for buffer_name in common_buffer_names:
+        #     lhs_dep = node1_name2dep[buffer_name]
+        #     rhs_dep = node2_name2dep[buffer_name]
+            
+        #     mapped_vars = compare_and_map_nodes(lhs_dep, rhs_dep)
+        #     if mapped_vars is not None:
+        #         print(mapped_vars)
+        #         if lhs_dep.get_numel() <= rhs_dep.get_numel():
+        #             self.try_apply_var_range(node1, node2._body)
+        #             #node1.apply_mapped_vars(mapped_vars, rhs_dep.ranges)
+        #         else:
+        #             self.try_apply_var_range(node2, node1._body)
+        #             #mapped_vars=reverse_key_value(
+        #              #   mapped_vars
+        #             #)
+        #             #node2.apply_mapped_vars(mapped_vars, lhs_dep.ranges)
+
+        #     ################################ TODO ###############################
+        #     ### Dep 에서 필요한 정보 위 함수에 넣기
+        #     ### 생성된 map 적용하기
+        #     ### 모든 dep에 전파 및 loop_body에 적용
+        
+        return score
     #######################################################################################
 
     def unfusable_node(self, node: BaseSchedulerNode) -> bool:
@@ -4262,8 +4474,8 @@ class Scheduler:
         ):
             shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
         ############################ WELDER #########################################
-        if shared_data_score < config.score_fusion_memory_threshold and config.common_indexing_fusion:
-            shared_data_score = self.shared_data_with_common_index(node1, node2)
+        # if shared_data_score < config.score_fusion_memory_threshold and config.common_indexing_fusion:
+        #     shared_data_score = self.shared_data_with_common_index(node1, node2)
         if shared_data_score < config.score_fusion_memory_threshold and config.force_matching_index:
             shared_data_score = self.shared_data_with_match_index(node1, node2)
         #############################################################################
@@ -4290,6 +4502,168 @@ class Scheduler:
             return V.choices.can_fuse_horizontal(
                 self, node1, node2, shared_data_score
             ) and self.get_backend(device).can_fuse_horizontal(node1, node2)
+        
+    #################################### WELDER ###########################################
+    def try_match_var_ranges(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        if node1 is node2:
+            return False
+        
+        if node1.is_template() or node2.is_template():
+            return self.can_fuse(node1, node2)
+
+        return self.can_fuse(node1, node2)
+
+
+
+    def can_fuse_semi(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        # 검사조건 완화 버전
+        # codegen이 가능한 fusion이 아닌 정보 조작시 가능해 보이는 조합에 대해 True 반환
+
+        if node1 is node2:
+            return False
+
+        why = WhyNoFuse(node1, node2)
+
+        if node1.is_template() and self.get_backend(
+            node1.get_device()
+        ).can_fuse_multi_outputs_template(node1, node2):
+            return True
+
+        if isinstance(node1, GroupedSchedulerNode) or isinstance(
+            node2, GroupedSchedulerNode
+        ):
+            why("grouped node must not be fused with other nodes")
+            return False
+        if (
+            isinstance(node1, (ExternKernelSchedulerNode, NopKernelSchedulerNode))
+            and not node1.is_template()
+        ):
+            why("node1 is extern or nop")
+            return False
+        if (
+            isinstance(node2, (ExternKernelSchedulerNode, NopKernelSchedulerNode))
+            and not node2.is_template()
+        ):
+            why("node2 is extern or nop")
+            return False
+
+        if node2.get_operation_names() & node1.ancestors:
+            why("node1 must go before node2")
+            return False
+
+        if node2.is_template():
+            if not config.prologue_fusion:
+                why("prologue fusion turned off")
+                return False
+
+            if node1.is_reduction() or node1.is_template():
+                why("prologue fusion only supported for pointwise nodes")
+                return False
+
+            template = node2.get_template_node_or_throw()
+            if not isinstance(template, ir.TritonTemplateBuffer):
+                why("prologue fusion only supported for TritonTemplates")
+                return False
+
+            allowed_prologue_inps = template.get_allowed_prologue_inps()
+
+            unsupported_prologue_args = (
+                OrderedSet(inp.get_name() for inp in template.inputs)
+                - allowed_prologue_inps
+            )
+
+            if node1.get_buffer_names() & unsupported_prologue_args:
+                why("prologue fusion not implemented for kernel for these inputs")
+                return False
+
+            if node1.has_aliasing_or_mutation() or node1.has_aliasing_or_mutation():
+                why("template prologue can only fuse functional pointwise nodes")
+                return False
+
+            prologue_nodes = node1.get_nodes()
+            for node in prologue_nodes[:-1]:
+                node_outs = node.get_outputs()
+                for out in node_outs:
+                    if not all(user.node in prologue_nodes for user in out.users):
+                        why("template prologue can only fuse nodes with a single use")
+                        return False
+
+            template_snodes = (
+                [node2]
+                if not isinstance(node2, FusedSchedulerNode)
+                else [n for n in node2.snodes if n.is_template()]
+            )
+            assert len(template_snodes) == 1
+            template_snode = template_snodes[0]
+
+            if not (
+                len(prologue_nodes[-1].outputs) == 1
+                and len(prologue_nodes[-1].outputs[0].users) == 1
+                and prologue_nodes[-1].outputs[0].users[0].node is template_snode
+            ):
+                why(
+                    "template prologue can only fuse nodes with a single use into template"
+                )
+                return False
+
+            if not self.check_prologue_fusion_heuristics_fusable(node1, node2, why):
+                return False
+
+        if node1.is_template() and (
+            node2.has_aliasing_or_mutation()
+            or node2.is_reduction()
+            or not config.epilogue_fusion
+        ):
+            why("template epilogue not satisfied")
+            return False
+
+        if (node1.get_buffer_names() & V.graph.no_fuse_buffer_names) or (
+            node2.get_buffer_names() & V.graph.no_fuse_buffer_names
+        ):
+            why("fusion for buffer explicit disabled")
+            return False
+
+        device = node1.get_device()
+        device2 = node2.get_device()
+        if device != device2:
+            why("device mismatch (%s vs %s)", device, device2)
+            return False
+        del device2
+
+        shared_data_score = self.score_fusion_memory_with_common_buf(node1, node2)
+
+        ############################ WELDER ################################### 
+        # if (
+        #     shared_data_score < config.score_fusion_memory_threshold
+        #     and config.loop_ordering_after_fusion
+        # ):
+        #     shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
+        # if shared_data_score < config.score_fusion_memory_threshold and config.common_indexing_fusion:
+        #     shared_data_score = self.shared_data_with_common_index(node1, node2)
+        # if shared_data_score < config.score_fusion_memory_threshold and config.force_matching_index:
+        #     shared_data_score = self.shared_data_with_match_index(node1, node2)
+        #############################################################################
+
+        if loop_ordering_log.isEnabledFor(logging.DEBUG):
+            loop_ordering_log.debug(
+                "%s and %s has %s shared data",
+                node1.get_name(),
+                node2.get_name(),
+                shared_data_score,
+            )
+
+        if not V.choices.can_fuse(self, node1, node2, shared_data_score):
+            return False
+
+        if node1.get_operation_names() & node2.ancestors:
+            # node2 depends on node1 outputs
+            return (
+                V.choices.can_fuse_vertical(self, node1, node2, shared_data_score)
+            )
+        else:  # nodes don't depend on each other, but may have common reads
+            return V.choices.can_fuse_horizontal(
+                self, node1, node2, shared_data_score
+            )
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -4462,6 +4836,36 @@ class Scheduler:
         return sum(self.dep_size_hint(dep) for dep in common_memory_deps)
 
     ################################ WELDER ######################################
+    def score_fusion_memory_with_common_buf(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        """
+        The first term in our fusion score that estimates number of saved
+        memory operations.
+        """
+        node1_buffer_names = node1.read_writes.buffer_names()
+        node2_buffer_names = node2.read_writes.buffer_names()
+        # Fast path: no common buffers.
+        common_buffer_names = node1_buffer_names & node2_buffer_names
+        if not common_buffer_names:
+            return 0
+
+        node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
+        node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
+
+        # Find the commons buffers that has different loop orders
+        score = sympy.S.One
+        for buffer_name in common_buffer_names:
+            lhs_dep = node1_name2dep[buffer_name]
+            rhs_dep = node2_name2dep[buffer_name]
+
+            dep_size = self.dep_size_hint(lhs_dep)
+
+            if lhs_dep.get_numel() == rhs_dep.get_numel() and dep_size == self.dep_size_hint(rhs_dep):
+                score += dep_size
+        
+        return score
+    
     def score_fusion_memory_with_index(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> int:
@@ -5588,6 +5992,75 @@ class Scheduler:
                 recompute_sizes_body_func=loop_split,
                 )
 
+        return node
+
+
+    def try_apply_var_range(self, node: BaseSchedulerNode, other: LoopBody, mapped_vars):
+        # var_range가 node에 적용하기에 타당한지 확인하는 과정
+        # recompute_size_and_body에 넘겨줄 def hook func 생성
+        extra_indexing_constraints = None
+
+        def apply_var_range(sizes, body, vars):
+            index_size, reduce_size = sizes
+            index_vars, reduce_vars = vars
+
+            #TODO : var_range를 필요에 맞게 적용하는 로직 구현
+            # split_idx = index_vars.index(split_var)
+            # new_index_size = index_size.copy()
+            # new_index_size[split_idx] = index_size[split_idx] // split_number
+            # new_index_size.insert(split_idx + 1, split_number)
+            # (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
+            #     new_index_size, reduce_size, prefix="y"
+            # )
+            # iter_vars = new_index_vars.copy()
+            # divisor_var = iter_vars.pop(split_idx + 1)
+            # iter_vars[split_idx] = split_number * iter_vars[split_idx] + divisor_var
+            other_index_size, other_reduce_size = other.sizes
+
+
+            (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
+                other_index_size, other_reduce_size, prefix="y"
+            )
+            iter_vars = [mapped_vars[var] for var in index_vars]
+            new_iter_vars = []
+
+            for expr in iter_vars:
+                subs_map = {}
+                
+                for s in expr.free_symbols:
+                    if s.name.startswith('p'):
+                        new_name = 'y' + s.name[1:]
+                        new_s = dependencies.sympy_index_symbol(new_name)
+                        subs_map[s] = new_s
+                        
+                new_expr = expr.subs(subs_map)
+                new_iter_vars.append(new_expr)
+            reduce_vars = other.reduce_vars
+            # var_ranges = other.var_ranges
+            # new_index_vars = []
+            # new_index_size = other.sizes[0]
+            # for vars in iter_vars:
+            #     for symbol in vars.free_symbols:
+            #         new_index_vars.append(symbol) 
+##########################################################################################
+            
+            body = ir.LoopBody(
+                body, [new_iter_vars, reduce_vars], var_ranges, new_index_vars, reduce_vars
+            )
+            nonlocal extra_indexing_constraints
+            if not extra_indexing_constraints:
+                extra_indexing_constraints = (
+                    body.var_ranges,
+                    list(body.indexing_exprs.values()),
+                )
+            return (
+                (other_index_size, reduce_size),
+                body,
+                (new_index_vars, reduce_vars),
+            )
+        # recompute 호출
+        for _node in node.get_nodes():
+            _node.recompute_size_and_body_with_cur_body(recompute_sizes_body_func=apply_var_range)
         return node
     ####################################################################
 
