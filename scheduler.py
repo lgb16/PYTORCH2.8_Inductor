@@ -4067,27 +4067,28 @@ class Scheduler:
                         return None
 
                 else:
-                    target_range = range2
-                    merged_range = range1
-                    vars_to_merge = [var1]
-                    k = i + 1
+                    return None
+                    # target_range = range2
+                    # merged_range = range1
+                    # vars_to_merge = [var1]
+                    # k = i + 1
                     
-                    while merged_range < target_range and k < len(node1_info):
-                        next_var, next_stride, next_range = node1_info[k]
-                        prev_var, prev_stride, prev_range = node1_info[k-1]
-                        if next_stride != prev_stride * prev_range:
-                            return None
+                    # while merged_range < target_range and k < len(node1_info):
+                    #     next_var, next_stride, next_range = node1_info[k]
+                    #     prev_var, prev_stride, prev_range = node1_info[k-1]
+                    #     if next_stride != prev_stride * prev_range:
+                    #         return None
                         
-                        merged_range *= next_range
-                        vars_to_merge.append(next_var*prev_range)
-                        k += 1
+                    #     merged_range *= next_range
+                    #     vars_to_merge.append(next_var*prev_range)
+                    #     k += 1
 
-                    if merged_range == target_range:
-                        mapped_vars[sum(vars_to_merge)] = var2
-                        j += 1
-                        i = k
-                    else:
-                        return None
+                    # if merged_range == target_range:
+                    #     mapped_vars[sum(vars_to_merge)] = var2
+                    #     j += 1
+                    #     i = k
+                    # else:
+                    #     return None
 
             if i < len(node1_info) or j < len(node2_info):
                 return None
@@ -4196,8 +4197,7 @@ class Scheduler:
             return 0
         
         if node1.group[1][0] < node2.group[1][0]:
-            base_node = node2
-            other_node = node1
+            return self.shared_data_with_match_index(node2, node1, buffer_name)
         else:
             base_node = node1
             other_node = node2
