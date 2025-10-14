@@ -1003,6 +1003,9 @@ class BaseSchedulerNode:
     
     def get_loop_with_buf(self, buffer_name):
         return None
+
+    def refresh_dep_and_group(self):
+        return None
     #####################################################################################################
 
 
@@ -1837,7 +1840,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
         return fused_tile_ranges
     
 
-    def propagate_output_tile(self, tile_var_ranges: Dict[str, Dict[sympy.Symbol, sympy.Expr]]):
+    def propagate_output_tile(self, tile_var_ranges: dict[str, dict[sympy.Symbol, sympy.Expr]]):
         topo_nodes = self.scheduler.topological_sort_schedule(self.snodes)
         topo_nodes.reverse()
 
@@ -1860,6 +1863,10 @@ class FusedSchedulerNode(BaseSchedulerNode):
             if buffer_name in node.read_writes.buffer_names() and node._body is not None:
                 out.append(node._body)
         return out
+
+    def refresh_dep_and_group(self):
+        refresh_group_node_dependencies(self)
+        self.group = max(self.snodes, key=lambda x: int(x.is_reduction())).group
     #################################################################################
 
 
@@ -3998,7 +4005,7 @@ class Scheduler:
         return self.score_fusion_memory_with_index(node1, node2)
 
     def shared_data_with_match_index(
-        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode, already_loop_split = False
     ) -> int:
         def compare_and_map(base_loop: LoopBody, other_loop: LoopBody, buffer_name):
             # mapping var in index(free_symbols)
@@ -4067,27 +4074,28 @@ class Scheduler:
                         return None
 
                 else:
-                    target_range = range2
-                    merged_range = range1
-                    vars_to_merge = [var1]
-                    k = i + 1
+                    return None
+                    # target_range = range2
+                    # merged_range = range1
+                    # vars_to_merge = [var1]
+                    # k = i + 1
                     
-                    while merged_range < target_range and k < len(node1_info):
-                        next_var, next_stride, next_range = node1_info[k]
-                        prev_var, prev_stride, prev_range = node1_info[k-1]
-                        if next_stride != prev_stride * prev_range:
-                            return None
+                    # while merged_range < target_range and k < len(node1_info):
+                    #     next_var, next_stride, next_range = node1_info[k]
+                    #     prev_var, prev_stride, prev_range = node1_info[k-1]
+                    #     if next_stride != prev_stride * prev_range:
+                    #         return None
                         
-                        merged_range *= next_range
-                        vars_to_merge.append(next_var*prev_range)
-                        k += 1
+                    #     merged_range *= next_range
+                    #     vars_to_merge.append(next_var*prev_range)
+                    #     k += 1
 
-                    if merged_range == target_range:
-                        mapped_vars[sum(vars_to_merge)] = var2
-                        j += 1
-                        i = k
-                    else:
-                        return None
+                    # if merged_range == target_range:
+                    #     mapped_vars[sum(vars_to_merge)] = var2
+                    #     j += 1
+                    #     i = k
+                    # else:
+                    #     return None
 
             if i < len(node1_info) or j < len(node2_info):
                 return None
@@ -4196,8 +4204,7 @@ class Scheduler:
             return 0
         
         if node1.group[1][0] < node2.group[1][0]:
-            base_node = node2
-            other_node = node1
+            return self.shared_data_with_match_index(node2, node1)
         else:
             base_node = node1
             other_node = node2
@@ -4225,9 +4232,23 @@ class Scheduler:
                 continue
             base_loop = base_loops[0]
             for other_loop in other_loops:
+                base_red_len = len(base_loop.reduce_vars)
+                other_red_len = len(other_loop.reduce_vars)
+
+                if base_red_len >=2 or other_red_len >=2:
+                    return 0
+                check_red_match = (base_red_len == 1 and other_red_len == 1)
+
                 _mapped_vars = compare_and_map(base_loop, other_loop, buffer_name)
                 if _mapped_vars is None:
                     continue
+
+                if check_red_match:
+                    base_red_var = base_loop.reduce_vars[0]
+                    other_red_var = other_loop.reduce_vars[0]
+                    if base_red_var != other_red_var.subs(_mapped_vars):
+                        continue
+
                 if mapped_vars is None:
                     mapped_vars = _mapped_vars
                 elif mapped_vars == _mapped_vars:
@@ -4239,10 +4260,10 @@ class Scheduler:
         # print(mapped_vars)
         self.try_apply_var_range(other_node, base_loop, mapped_vars)
         score = self.score_fusion_memory_with_index(node1, node2)
-        if score == 0 and config.loop_split_index_matching:
+        if score == 0 and not already_loop_split and config.loop_split_index_matching:
             node1 = self.try_loop_split(node1)
             node2 = self.try_loop_split(node2)
-            self.shared_data_with_match_index(node1, node2)
+            self.shared_data_with_match_index(node1, node2, already_loop_split = True)
             score = self.score_fusion_memory_with_index(node1, node2)
         # node1_buffer_names = node1.read_writes.buffer_names()
         # node2_buffer_names = node2.read_writes.buffer_names()
@@ -6022,7 +6043,9 @@ class Scheduler:
                 other_index_size, other_reduce_size, prefix="y"
             )
             iter_vars = [mapped_vars[var] for var in index_vars]
+            reduce_vars = [mapped_vars[var] for var in reduce_vars]
             new_iter_vars = []
+            new_reduce_vars = []
 
             for expr in iter_vars:
                 subs_map = {}
@@ -6035,7 +6058,21 @@ class Scheduler:
                         
                 new_expr = expr.subs(subs_map)
                 new_iter_vars.append(new_expr)
-            reduce_vars = other.reduce_vars
+            
+            for expr in reduce_vars:
+                subs_map = {}
+                
+                for s in expr.free_symbols:
+                    if s.name.startswith('p'):
+                        new_name = 'y' + s.name[1:]
+                        new_s = dependencies.sympy_index_symbol(new_name)
+                        subs_map[s] = new_s
+                        
+                new_expr = expr.subs(subs_map)
+                new_reduce_vars.append(new_expr)
+                if new_expr in new_index_vars:
+                    new_index_vars.remove(new_expr)
+            # reduce_vars = other.reduce_vars
             # var_ranges = other.var_ranges
             # new_index_vars = []
             # new_index_size = other.sizes[0]
@@ -6045,7 +6082,7 @@ class Scheduler:
 ##########################################################################################
             
             body = ir.LoopBody(
-                body, [new_iter_vars, reduce_vars], var_ranges, new_index_vars, reduce_vars
+                body, [new_iter_vars, new_reduce_vars], var_ranges, new_index_vars, new_reduce_vars
             )
             nonlocal extra_indexing_constraints
             if not extra_indexing_constraints:
@@ -6061,6 +6098,7 @@ class Scheduler:
         # recompute 호출
         for _node in node.get_nodes():
             _node.recompute_size_and_body_with_cur_body(recompute_sizes_body_func=apply_var_range)
+        node.refresh_dep_and_group()
         return node
     ####################################################################
 
