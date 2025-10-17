@@ -1304,12 +1304,12 @@ class SIMDScheduling(BaseScheduling):
             return False
         return True
 
-    if config.common_indexing_fusion:
-        can_fuse_vertical = can_fuse_with_index
-        can_fuse_horizontal = can_fuse_with_index
-    else:
-        can_fuse_vertical = can_fuse
-        can_fuse_horizontal = can_fuse
+    # if config.common_indexing_fusion:
+    #     can_fuse_vertical = can_fuse_with_index
+    #     can_fuse_horizontal = can_fuse_with_index
+    # else:
+    can_fuse_vertical = can_fuse
+    can_fuse_horizontal = can_fuse
     ##########################################################################
     # can_fuse_vertical = can_fuse
     # can_fuse_horizontal = can_fuse

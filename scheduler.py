@@ -1003,6 +1003,9 @@ class BaseSchedulerNode:
     
     def get_loop_with_buf(self, buffer_name):
         return None
+
+    def refresh_dep_and_group(self):
+        return None
     #####################################################################################################
 
 
@@ -1837,7 +1840,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
         return fused_tile_ranges
     
 
-    def propagate_output_tile(self, tile_var_ranges: Dict[str, Dict[sympy.Symbol, sympy.Expr]]):
+    def propagate_output_tile(self, tile_var_ranges: dict[str, dict[sympy.Symbol, sympy.Expr]]):
         topo_nodes = self.scheduler.topological_sort_schedule(self.snodes)
         topo_nodes.reverse()
 
@@ -1860,6 +1863,10 @@ class FusedSchedulerNode(BaseSchedulerNode):
             if buffer_name in node.read_writes.buffer_names() and node._body is not None:
                 out.append(node._body)
         return out
+
+    def refresh_dep_and_group(self):
+        refresh_group_node_dependencies(self)
+        self.group = max(self.snodes, key=lambda x: int(x.is_reduction())).group
     #################################################################################
 
 
@@ -3158,8 +3165,6 @@ class Scheduler:
         If config.benchmark_fusion is False, always return True.
         Otherwise, return True if fusion can brings speedup.
         """
-        if config.always_skip_benchmark:
-            return True
 
         is_multi_template = any(
             n.is_template()
@@ -3322,6 +3327,13 @@ class Scheduler:
 
                 log_fusion(min_ms_fused, ms1, ms2)
 
+                ######################## WELDER ########################
+                if config.always_skip_benchmark and ms_fused_choice is not None:
+                    multi_node.finalize_as_triton_caller(ms_fused_choice)
+                    multi_node._choice_timings = new_timings
+                    return True
+                ########################################################
+
                 if min_ms_fused < (ms1 + ms2) and ms_fused_choice is not None:
                     multi_node.finalize_as_triton_caller(ms_fused_choice)
                     multi_node._choice_timings = new_timings
@@ -3392,6 +3404,11 @@ class Scheduler:
                                 "slow_down_ratio": ms_fused / (ms1 + ms2),
                             }
                         )
+                
+                    ######################## WELDER ########################
+                    if config.always_skip_benchmark:
+                        return True
+                    ########################################################
 
                     return ms_fused < ms1 + ms2
 
@@ -3998,7 +4015,7 @@ class Scheduler:
         return self.score_fusion_memory_with_index(node1, node2)
 
     def shared_data_with_match_index(
-        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode, already_loop_split = False
     ) -> int:
         def compare_and_map(base_loop: LoopBody, other_loop: LoopBody, buffer_name):
             # mapping var in index(free_symbols)
@@ -4195,9 +4212,11 @@ class Scheduler:
         # 둘중 하나가 Template인 경우, Template을 기준으로 range 맞추기?
         if node1.is_template() or node2.is_template():
             return 0
+        if node1.group[1][1] != node2.group[1][1]:
+            return 0
         
         if node1.group[1][0] < node2.group[1][0]:
-            return self.shared_data_with_match_index(node2, node1, buffer_name)
+            return self.shared_data_with_match_index(node2, node1)
         else:
             base_node = node1
             other_node = node2
@@ -4225,9 +4244,23 @@ class Scheduler:
                 continue
             base_loop = base_loops[0]
             for other_loop in other_loops:
+                base_red_len = len(base_loop.reduce_vars)
+                other_red_len = len(other_loop.reduce_vars)
+
+                if base_red_len >=2 or other_red_len >=2:
+                    return 0
+                check_red_match = (base_red_len == 1 and other_red_len == 1)
+
                 _mapped_vars = compare_and_map(base_loop, other_loop, buffer_name)
                 if _mapped_vars is None:
                     continue
+
+                if check_red_match:
+                    base_red_var = base_loop.reduce_vars[0]
+                    other_red_var = other_loop.reduce_vars[0]
+                    if base_red_var != other_red_var.subs(_mapped_vars):
+                        continue
+
                 if mapped_vars is None:
                     mapped_vars = _mapped_vars
                 elif mapped_vars == _mapped_vars:
@@ -4239,10 +4272,10 @@ class Scheduler:
         # print(mapped_vars)
         self.try_apply_var_range(other_node, base_loop, mapped_vars)
         score = self.score_fusion_memory_with_index(node1, node2)
-        if score == 0 and config.loop_split_index_matching:
+        if score == 0 and not already_loop_split and config.loop_split_index_matching:
             node1 = self.try_loop_split(node1)
             node2 = self.try_loop_split(node2)
-            self.shared_data_with_match_index(node1, node2)
+            self.shared_data_with_match_index(node1, node2, already_loop_split = True)
             score = self.score_fusion_memory_with_index(node1, node2)
         # node1_buffer_names = node1.read_writes.buffer_names()
         # node2_buffer_names = node2.read_writes.buffer_names()
@@ -6017,12 +6050,22 @@ class Scheduler:
             # iter_vars[split_idx] = split_number * iter_vars[split_idx] + divisor_var
             other_index_size, other_reduce_size = other.sizes
 
+            if not reduce_size and other_reduce_size:
+                other_index_size = other_index_size + other_reduce_size
+                other_reduce_size = ()
+            
+            #     (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
+            #         other_index_size, reduce_size, prefix="y"
+            #     )
 
             (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
                 other_index_size, other_reduce_size, prefix="y"
             )
+
             iter_vars = [mapped_vars[var] for var in index_vars]
+            reduce_vars = [mapped_vars[var] for var in reduce_vars]
             new_iter_vars = []
+            new_reduce_vars = []
 
             for expr in iter_vars:
                 subs_map = {}
@@ -6035,7 +6078,32 @@ class Scheduler:
                         
                 new_expr = expr.subs(subs_map)
                 new_iter_vars.append(new_expr)
-            reduce_vars = other.reduce_vars
+            
+            for expr in reduce_vars:
+                subs_map = {}
+                
+                for s in expr.free_symbols:
+                    if s.name.startswith('p'):
+                        new_name = 'y' + s.name[1:]
+                        new_s = dependencies.sympy_index_symbol(new_name)
+                        subs_map[s] = new_s
+                        
+                new_expr = expr.subs(subs_map)
+                new_reduce_vars.append(new_expr)
+                if new_expr in new_index_vars:
+                    new_index_vars.remove(new_expr)
+
+            new_var_ranges = {}
+            iter_free_sym = [s for expr in new_iter_vars for s in expr.free_symbols]
+            reduce_free_sym = [s for expr in new_reduce_vars for s in expr.free_symbols]
+            for var, size in var_ranges.items():
+                if var in iter_free_sym or var in reduce_free_sym or var in new_index_vars:
+                    new_var_ranges[var] = size
+            for sym in reduce_free_sym:
+                if sym not in new_var_ranges:
+                    new_var_ranges[sym] = reduce_size      
+                    
+            # reduce_vars = other.reduce_vars
             # var_ranges = other.var_ranges
             # new_index_vars = []
             # new_index_size = other.sizes[0]
@@ -6045,7 +6113,7 @@ class Scheduler:
 ##########################################################################################
             
             body = ir.LoopBody(
-                body, [new_iter_vars, reduce_vars], var_ranges, new_index_vars, reduce_vars
+                body, [new_iter_vars, new_reduce_vars], new_var_ranges, new_index_vars, new_reduce_vars
             )
             nonlocal extra_indexing_constraints
             if not extra_indexing_constraints:
@@ -6061,6 +6129,7 @@ class Scheduler:
         # recompute 호출
         for _node in node.get_nodes():
             _node.recompute_size_and_body_with_cur_body(recompute_sizes_body_func=apply_var_range)
+        node.refresh_dep_and_group()
         return node
     ####################################################################
 
