@@ -3165,8 +3165,6 @@ class Scheduler:
         If config.benchmark_fusion is False, always return True.
         Otherwise, return True if fusion can brings speedup.
         """
-        if config.always_skip_benchmark:
-            return True
 
         is_multi_template = any(
             n.is_template()
@@ -3329,6 +3327,13 @@ class Scheduler:
 
                 log_fusion(min_ms_fused, ms1, ms2)
 
+                ######################## WELDER ########################
+                if config.always_skip_benchmark and ms_fused_choice is not None:
+                    multi_node.finalize_as_triton_caller(ms_fused_choice)
+                    multi_node._choice_timings = new_timings
+                    return True
+                ########################################################
+
                 if min_ms_fused < (ms1 + ms2) and ms_fused_choice is not None:
                     multi_node.finalize_as_triton_caller(ms_fused_choice)
                     multi_node._choice_timings = new_timings
@@ -3399,6 +3404,11 @@ class Scheduler:
                                 "slow_down_ratio": ms_fused / (ms1 + ms2),
                             }
                         )
+                
+                    ######################## WELDER ########################
+                    if config.always_skip_benchmark:
+                        return True
+                    ########################################################
 
                     return ms_fused < ms1 + ms2
 
@@ -4201,6 +4211,8 @@ class Scheduler:
         # 둘다 Template인 경우, 0반환
         # 둘중 하나가 Template인 경우, Template을 기준으로 range 맞추기?
         if node1.is_template() or node2.is_template():
+            return 0
+        if node1.group[1][1] != node2.group[1][1]:
             return 0
         
         if node1.group[1][0] < node2.group[1][0]:
@@ -6038,10 +6050,18 @@ class Scheduler:
             # iter_vars[split_idx] = split_number * iter_vars[split_idx] + divisor_var
             other_index_size, other_reduce_size = other.sizes
 
+            if not reduce_size and other_reduce_size:
+                other_index_size = other_index_size + other_reduce_size
+                other_reduce_size = ()
+            
+            #     (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
+            #         other_index_size, reduce_size, prefix="y"
+            #     )
 
             (new_index_vars, _), var_ranges = dependencies.index_vars_no_squeeze(
                 other_index_size, other_reduce_size, prefix="y"
             )
+
             iter_vars = [mapped_vars[var] for var in index_vars]
             reduce_vars = [mapped_vars[var] for var in reduce_vars]
             new_iter_vars = []
@@ -6072,6 +6092,17 @@ class Scheduler:
                 new_reduce_vars.append(new_expr)
                 if new_expr in new_index_vars:
                     new_index_vars.remove(new_expr)
+
+            new_var_ranges = {}
+            iter_free_sym = [s for expr in new_iter_vars for s in expr.free_symbols]
+            reduce_free_sym = [s for expr in new_reduce_vars for s in expr.free_symbols]
+            for var, size in var_ranges.items():
+                if var in iter_free_sym or var in reduce_free_sym or var in new_index_vars:
+                    new_var_ranges[var] = size
+            for sym in reduce_free_sym:
+                if sym not in new_var_ranges:
+                    new_var_ranges[sym] = reduce_size      
+                    
             # reduce_vars = other.reduce_vars
             # var_ranges = other.var_ranges
             # new_index_vars = []
@@ -6082,7 +6113,7 @@ class Scheduler:
 ##########################################################################################
             
             body = ir.LoopBody(
-                body, [new_iter_vars, new_reduce_vars], var_ranges, new_index_vars, new_reduce_vars
+                body, [new_iter_vars, new_reduce_vars], new_var_ranges, new_index_vars, new_reduce_vars
             )
             nonlocal extra_indexing_constraints
             if not extra_indexing_constraints:
